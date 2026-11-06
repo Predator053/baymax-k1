@@ -11,7 +11,7 @@ BT_SINK="bluez_output.$(echo "$BT_MAC" | tr ':' '_').1"
 echo "══════════ 大白演示自检 $(date '+%H:%M:%S') ══════════"
 
 echo "【1】进程"
-pgrep -f 'python3 -u baymax_3.3.py' >/dev/null && ok "主程序在跑" || no "主程序没跑"
+pgrep -f 'python3 -u baymax_main.py' >/dev/null && ok "主程序在跑" || no "主程序没跑"
 pgrep -f 'baymax_panel.py' >/dev/null && ok "面板在跑" || no "面板没跑"
 pgrep -f arecord >/dev/null && ok "唤醒监听在跑" || no "唤醒监听没跑"
 
@@ -43,7 +43,7 @@ PY
 echo "【5】三类问答分流"
 python3 - <<'PY'
 import importlib.util, sys
-spec = importlib.util.spec_from_file_location("bm", "/home/baymax/Baymax_v14/baymax_3.3.py")
+spec = importlib.util.spec_from_file_location("bm", "/home/baymax/Baymax_v14/baymax_main.py")
 mod = importlib.util.module_from_spec(spec); sys.modules["bm"] = mod
 try: spec.loader.exec_module(mod)
 except SystemExit: pass
@@ -70,7 +70,7 @@ PY
 echo "【6.5】关键语句语音缓存（没缓存=现场没有声音）"
 python3 - <<'PY' 2>&1 | grep -vE '^\[' | head -10
 import importlib.util, sys, os
-spec = importlib.util.spec_from_file_location("bm", "/home/baymax/Baymax_v14/baymax_3.3.py")
+spec = importlib.util.spec_from_file_location("bm", "/home/baymax/Baymax_v14/baymax_main.py")
 mod = importlib.util.module_from_spec(spec); sys.modules["bm"] = mod
 try: spec.loader.exec_module(mod)
 except SystemExit: pass

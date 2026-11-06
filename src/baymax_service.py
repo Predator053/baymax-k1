@@ -1,17 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""大白 3.0 服务层：健康档案 / 用药提醒 / 网页面板指令通道。
-
-设计要点：主程序只负责"说话"，这里负责"记事和提醒"。
-两者通过 ~/.baymax/ 下的三个文件通信，不需要 socket 或额外依赖：
-
-  state.json     主程序写入：当前状态 + 最近一轮对话（面板只读）
-  events.jsonl   追加写：每一次交互、跌倒、提醒、测量（健康档案）
-  reminders.json 用药提醒计划（面板可增删，主程序定时读取）
-  cmd.json       面板写的指令（模拟跌倒 / 让它说一句 / 加提醒）
-
-这样即使面板进程挂了，语音主链路也不受影响。
-"""
 import json
 import os
 import threading
@@ -44,7 +32,6 @@ def _read_json(path, default):
 
 
 def _write_json(path, data):
-    """原子写：先写临时文件再 rename，避免面板读到半截 JSON。"""
     tmp = path + ".tmp"
     try:
         with open(tmp, "w", encoding="utf-8") as f:
@@ -55,7 +42,6 @@ def _write_json(path, data):
 
 
 def append_event(kind, **fields):
-    """往健康档案追加一条事件。"""
     _ensure_dir()
     rec = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "kind": kind}
     rec.update(fields)
@@ -100,7 +86,6 @@ def save_reminders(items):
 
 
 class Service:
-    """主程序里跑的两个后台线程：用药提醒 + 面板指令。"""
 
     def __init__(self, say=None, on_fall=None, on_stop=None, stop_event=None):
         self.say = say or (lambda text: False)
@@ -111,7 +96,6 @@ class Service:
         self._threads = []
         _ensure_dir()
 
-    # ---------- 对外：让面板看到当前状态 ----------
     def note_turn(self, question="", answer="", latency=None, mode=""):
         state = _read_json(STATE_PATH, {})
         state.update({
@@ -133,7 +117,6 @@ class Service:
         _write_json(STATE_PATH, state)
 
     def note_metric(self, key, value):
-        """记录一条性能指标（面板展示用），例如唤醒→出声的毫秒数。"""
         state = _read_json(STATE_PATH, {})
         metrics = state.get("metrics")
         if not isinstance(metrics, dict):
@@ -143,7 +126,6 @@ class Service:
         _write_json(STATE_PATH, state)
 
     def bump_metric(self, key, delta=1):
-        """计数器累加，例如缓存命中次数。"""
         state = _read_json(STATE_PATH, {})
         metrics = state.get("metrics")
         if not isinstance(metrics, dict):
@@ -155,7 +137,6 @@ class Service:
         state["metrics"] = metrics
         _write_json(STATE_PATH, state)
 
-    # ---------- 后台线程 ----------
     def start(self):
         for target, name in ((self._reminder_loop, "Reminder"), (self._command_loop, "PanelCmd")):
             th = threading.Thread(target=target, name=name, daemon=True)
@@ -196,7 +177,6 @@ class Service:
                     self._dispatch(cmd)
             except Exception:
                 pass
-            # 每 15 秒刷新一次面板状态（存活信号）
             if time.monotonic() - last_report > 15:
                 last_report = time.monotonic()
                 state = _read_json(STATE_PATH, {})
@@ -206,7 +186,6 @@ class Service:
             self.stop_event.wait(1.0)
 
     def _sensors(self):
-        """硬件模块是可选依赖：拿不到就返回 None，绝不因为面板按钮崩主程序。"""
         try:
             import baymax_sensors as s
             return s
@@ -216,8 +195,6 @@ class Service:
     def _dispatch(self, cmd):
         name = str(cmd.get("cmd"))
         if name == "fall":
-            # 优先让传感器回放一次跌倒波形，这样走的是完整的"数据 → 状态机 → 关怀"链路；
-            # 真机接了 MPU6050 时 inject 不生效，退化成直接触发事件。
             s = self._sensors()
             via_sensor = False
             if s is not None:

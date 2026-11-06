@@ -1,11 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""软件 I2C（bit-bang）：内核没给排针开 I2C 时，用两个 GPIO 手动打时序。
-
-用法：
-    python3 soft_i2c.py            # 扫 0x08~0x77
-    python3 soft_i2c.py 0x68       # 只测 0x68，读 WHO_AM_I
-"""
 import sys
 import time
 
@@ -13,9 +7,9 @@ import gpiod
 from gpiod.line import Bias, Direction, Drive, Value
 
 CHIP = "/dev/gpiochip0"
-SDA = 41   # 排针 3 号针 = GPIO41 = SDA
-SCL = 40   # 排针 5 号针 = GPIO40 = SCL
-HALF = 6e-6   # 半周期（约 80kHz）
+SDA = 41
+SCL = 40
+HALF = 6e-6
 
 
 class SoftI2C:
@@ -37,7 +31,6 @@ class SoftI2C:
         self.set_sda(1)
         self.set_scl(1)
 
-    # ---------- 电平 ----------
     def set_sda(self, v):
         self.req.set_value(self.sda, Value.ACTIVE if v else Value.INACTIVE)
 
@@ -50,7 +43,6 @@ class SoftI2C:
     def _d(self):
         time.sleep(self.half)
 
-    # ---------- 基本时序 ----------
     def start(self):
         self.set_sda(1); self.set_scl(1); self._d()
         self.set_sda(0); self._d()
@@ -67,7 +59,6 @@ class SoftI2C:
         self.set_scl(0); self._d()
 
     def _read_bit(self):
-        # 释放 SDA（切成输入，由上拉拉高），读一位
         self.req.reconfigure_lines({self.sda: self._in_sda})
         self._d()
         self.set_scl(1); self._d()
@@ -81,7 +72,7 @@ class SoftI2C:
     def _write_byte(self, byte):
         for i in range(7, -1, -1):
             self._write_bit((byte >> i) & 1)
-        return self._read_bit()      # 0 = ACK，1 = NAK
+        return self._read_bit()
 
     def _read_byte(self, ack=True):
         v = 0
@@ -90,7 +81,6 @@ class SoftI2C:
         self._write_bit(0 if ack else 1)
         return v
 
-    # ---------- 事务 ----------
     def write(self, addr, reg, data):
         self.start()
         if self._write_byte(addr << 1):
@@ -118,7 +108,6 @@ class SoftI2C:
         self.stop()
         return nak == 0
 
-    # ---------- smbus2 兼容接口（让 Mpu6050 这类代码直接复用）----------
     def read_byte_data(self, addr, reg):
         return self.read(addr, reg, 1)[0]
 

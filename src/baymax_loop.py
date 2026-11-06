@@ -1,22 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""大白闭环决策引擎
-
-把「传感器 → 判断 → 动作 → 反馈 → 记录」串成一个可解释的闭环，
-而不是东一榔头西一棒子地触发告警。
-
-    感知 Sense      : MPU6050 / 麦克风 / 摄像头 / GPS / 时钟
-    评估 Assess     : 把信号折算成 L0~L3 风险等级
-    决策 Decide     : 每个等级对应一组动作（说话 / 抓拍 / 钉钉 / 短信 / 电话）
-    执行 Act        : 主程序真正去做
-    反馈 Feedback   : 用户回答、送达结果 → 改写等级（取消或升级）
-    记录 Record     : 写事件，供面板和复盘
-
-设计原则：
-  1. 任何告警都必须能被用户一句话取消（降低误报代价）
-  2. 取消不了就升级（无人应答 → 电话），而不是原地等
-  3. 每一级都记录可解释的判断依据
-"""
 
 from __future__ import annotations
 
@@ -27,12 +10,11 @@ from typing import Any, Dict, List, Optional
 
 
 class Level(IntEnum):
-    """风险等级。数字越大越紧急。"""
 
-    NORMAL = 0        # 一切正常
-    ATTENTION = 1     # 需要关注：数值异常、轻微不适
-    WARNING = 2       # 需要通知：确认跌倒、急症症状
-    CRITICAL = 3      # 立即求救：明确呼救、跌倒无人应答、危重数值
+    NORMAL = 0
+    ATTENTION = 1
+    WARNING = 2
+    CRITICAL = 3
 
     @property
     def label(self) -> str:
@@ -46,8 +28,8 @@ class Level(IntEnum):
 
 class Action:
     SPEAK = "speak"
-    ASK = "ask"            # 说话并等待回答
-    CAPTURE = "capture"    # 摄像头抓拍
+    ASK = "ask"
+    CAPTURE = "capture"
     DINGTALK = "dingtalk"
     SMS = "sms"
     CALL = "call"
@@ -65,7 +47,6 @@ class Decision:
     ts: float = field(default_factory=time.time)
 
     def trace(self) -> Dict[str, Any]:
-        """写进事件日志的闭环轨迹。"""
         return {
             "level": int(self.level),
             "level_label": self.level.label,
@@ -76,22 +57,14 @@ class Decision:
         }
 
 
-# --------------------------------------------------------------------------
-# 评估：把不同来源的信号折算成等级
-# --------------------------------------------------------------------------
-
-#: 老人表示"没事"的词
 OKAY_WORDS = ("没事", "没事儿", "不用", "别通知", "不要通知", "我挺好", "还好",
               "没摔着", "没受伤", "不用叫", "别叫", "我很好")
 
-#: 明确的求助/危急词
 SOS_WORDS = ("救命", "快来人", "打120", "叫救护车", "我不行了", "喘不上气",
              "胸口疼", "胸口痛", "心口疼", "动不了", "起不来", "流血",
              "晕过去", "抽过去", "说不出话")
 
-#: 高危生命体征阈值
 VITAL_RULES = [
-    # (字段, 判定函数, 等级, 说明, 播报 key)
     ("bp_sys", lambda v: v >= 180, Level.CRITICAL, "收缩压≥180", "vital_vital_bp_danger"),
     ("bp_sys", lambda v: 140 <= v < 180, Level.ATTENTION, "收缩压偏高", "vital_vital_bp_high"),
     ("bp_sys", lambda v: 0 < v < 90, Level.WARNING, "收缩压低", "vital_vital_bp_low"),
@@ -120,7 +93,6 @@ def _said_sos(reply: str) -> bool:
 def assess_fall(g_force: float = 0.0, reply: str = "",
                 faces: Optional[int] = None,
                 position: Optional[str] = None) -> Decision:
-    """跌倒闭环的第一环：先问，再根据回答决定要不要惊动家属。"""
     data = {"g": round(g_force, 2), "reply": reply, "faces": faces, "position": position}
     if _said_okay(reply):
         return Decision(
@@ -158,7 +130,6 @@ def assess_fall(g_force: float = 0.0, reply: str = "",
 
 
 def assess_vitals(vitals: Dict[str, Any]) -> Decision:
-    """生命体征闭环：一条异常读数 → 等级 + 对应播报（都走缓存）。"""
     worst_level = Level.NORMAL
     best_key = None
     reasons = []
@@ -195,7 +166,6 @@ def assess_vitals(vitals: Dict[str, Any]) -> Decision:
 
 
 def assess_utterance(text: str) -> Decision:
-    """语音闭环：用户说出的话本身也可能是告警信号。"""
     if not text:
         return Decision(level=Level.NORMAL, reason="空输入", actions=[])
     if _said_sos(text):
@@ -210,17 +180,7 @@ def assess_utterance(text: str) -> Decision:
                     data={"text": text})
 
 
-# --------------------------------------------------------------------------
-# 反馈：告警发出后，用户还能改主意
-# --------------------------------------------------------------------------
-
 class PendingAlert:
-    """一次已发出、但还能被取消或升级的告警。
-
-    闭环关键：
-      - 用户在 T 秒内说"我没事" → 取消
-      - 一直没动静 → 按升级策略走（打电话）
-    """
 
     def __init__(self, decision: Decision, escalate_after: float = 45.0):
         self.decision = decision
@@ -257,7 +217,6 @@ class PendingAlert:
 
 
 class ClosedLoop:
-    """闭环控制器：持有当前待确认的告警，处理用户反馈。"""
 
     def __init__(self):
         self.pending: Optional[PendingAlert] = None
@@ -273,7 +232,6 @@ class ClosedLoop:
         return alert
 
     def feedback(self, text: str) -> Optional[str]:
-        """用户说了一句话，闭环要不要改主意？返回 'cancelled' / None。"""
         if self.pending is None:
             return None
         if _said_okay(text):
@@ -302,7 +260,6 @@ class ClosedLoop:
             self.pending = None
 
 
-#: 免责声明（必须出现在所有对外文案里）
 DISCLAIMER_SHORT = "大白是健康辅助工具，不能代替医生诊断。"
 DISCLAIMER_FULL = (
     "需要说明的是：我可以帮您了解健康知识、记录身体数据、在紧急时通知家人，"

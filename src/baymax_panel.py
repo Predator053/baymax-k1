@@ -1,18 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""大白 3.3 网页面板（没有触摸屏时的替代方案）。
-
-    python3 baymax_panel.py [端口]
-
-电脑或手机浏览器打开 http://<K1的IP>:8000 就能看到：
-  - 大白状态与最近一轮对话（含分项时延）
-  - 性能看板：唤醒→出声、端到端平均、缓存命中率、累计轮次
-  - 健康档案 / 健康数据 / 用药提醒 / 硬件状态
-  - 演示按钮：模拟跌倒 / 测心率血氧 / 让它说一句 / 停止播报
-
-设计取向：暖白、圆角、柔和阴影，呼应「大白」本身的气质——安静、可靠、不刺眼。
-它只读写 ~/.baymax/ 下的文件，和语音主程序解耦：面板崩了不影响说话。
-"""
 import json
 import os
 import sys
@@ -367,7 +354,6 @@ class Handler(BaseHTTPRequestHandler):
             return self._snapshot()
         if self.path.startswith("/api/state"):
             state = svc._read_json(svc.STATE_PATH, {})
-            # 超过 90 秒没心跳就当离线
             online = False
             try:
                 hb = time.mktime(time.strptime(state.get("hb") or state.get("ts"),
@@ -390,7 +376,6 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(404, '{"error":"not found"}')
 
     def _snapshot(self):
-        """抓一张 CSI 摄像头画面给网页显示（?live=1 时现场抓，否则用缓存）。"""
         path = os.path.join(svc.HOME_DIR, "snapshot.jpg")
         live = "live=1" in self.path
         if live or not os.path.isfile(path):
@@ -422,7 +407,6 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(404, '{"error":"not found"}')
 
     def _hw(self):
-        """硬件状态由主程序写到 ~/.baymax/hw.json，面板只读，避免重复探测。"""
         try:
             with open(os.path.join(svc.HOME_DIR, "hw.json"), "r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -431,7 +415,6 @@ class Handler(BaseHTTPRequestHandler):
             return {}
 
     def _stack(self):
-        """能力链状态：本地大模型是否在线、知识库条数。10 秒缓存，避免拖慢页面。"""
         global _STACK_CACHE
         now = time.time()
         if now - _STACK_CACHE.get("ts", 0) < 10:

@@ -24,7 +24,7 @@
 
 ```
 src/
-  baymax_3.3.py       语音主循环、知识检索、TTS 队列、跌倒与关怀闭环
+  baymax_main.py      语音主循环、知识检索、TTS 队列、跌倒与关怀闭环
   baymax_sensors.py   MPU6050 / EC20(4G) / CSI 摄像头 / GPS / 短信
   baymax_loop.py      风险评估与决策（L0–L3），可撤销告警
   baymax_health.py    口语数值解析（含中文数字）、卫健委分级、建档
@@ -67,7 +67,7 @@ export BAYMAX_OUTPUT_DEVICE="default"        # PipeWire → 蓝牙音响
 
 # 4. 启动主程序（建议在 tmux 里跑，键盘快捷键才有效）
 tmux new -s baymax
-cd src && python3 -u baymax_3.3.py
+cd src && python3 -u baymax_main.py
 
 # 5. 网页面板与实时终端
 python3 baymax_panel.py 8000      # http://<板子IP>:8000

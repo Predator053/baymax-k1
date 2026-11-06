@@ -1,11 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""大白实时终端监视器（只读）。
-
-浏览器打开 http://<板子IP>:8001 就能实时看到主程序终端在打印什么。
-原理：定时执行 tmux capture-pane 抓取会话画面，前端轮询渲染。
-无需任何第三方库。
-"""
 import json
 import os
 import subprocess
@@ -76,7 +70,6 @@ setInterval(tick,800); tick();
 
 
 def capture():
-    """抓取 tmux 会话当前画面。"""
     try:
         r = subprocess.run(["tmux", "capture-pane", "-pt", SESSION],
                            capture_output=True, text=True, timeout=5)

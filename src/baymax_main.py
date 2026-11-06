@@ -1,31 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-大白健康陪护助手 - 2.0（K1 省赛版）
-
-2.0 在板子现场版（v17.1 + 11/4 唤醒应答/TTS 等待）基础上增加：
-路径自愈 / 医疗语音缓存秒播 / 急救快速通道 / 唤醒调优 /
-MPU6050 跌倒与 EC20 告警接入 / 时延埋点。
-
-在 v16.9 基础上增加：
-11. 加入无需新增依赖的本地 JSONL 健康知识检索，LLM 回答前注入检索内容与来源字段。
-12. 增加 --kb-test 检索自测入口；内置知识用于演示原型，条目标记待审核，不冒充权威指南。
-13. 修复血压数值“120/80”误命中急救知识、否定症状仍注入检索结果等问题。
-14. 将“摔倒”与“摔倒后无法起身”分开处理，避免单纯摔倒自动触发外部通知。
-15. 增加知识条目格式校验、检索内容长度限制和内置回归自测。
-7. 本地 LLM 模型清单探测（/v1/models），避免只凭 /health 判断模型正确。
-8. 记录 LLM 首个内容块延迟、请求总耗时与输出字符数；不把字符数冒充 token 数。
-9. 明确 RVV/IME 属于 llama.cpp 构建/运行时能力，Python 启动检查不虚报其已启用。
-10. 修复跨分句否定/历史词导致当前急症漏报，以及只检查首个求助词命中的问题。
-
-基于 v16.6 的最小改动：
-1. TTS 入队、计数和停止清队使用统一锁保护。
-2. KWS 暂停时不在音频条件锁内等待子进程退出。
-3. 急症提示优先；家属通知是可选动作，不是拨打 120 的前置条件。
-4. 改进急症否定语义的基础过滤，仍需结合实机用例验证。
-5. 退出时报告线程/子进程实际状态，不虚报全部退出。
-6. 保留原有模型路径、LLM 地址、音频设备及核心功能。
-"""
 
 import os
 import sys
@@ -62,17 +36,11 @@ except Exception as e:
     sf = None
     SHERPA_OK = False
 
-# ==================== 核心配置 ====================
-# 【路径自愈】原来把路径全部写死成 ~/Baymax_v14/...。
-# 目录一备份/改名（例如放到 桌面/大白_v17.1_完整备份_xxx/Baymax_v14），
-# TTS 模型和语音缓存就都找不到：表现为"没声音 / 每条都要现场合成"。
-# 现在按 环境变量 > 脚本所在目录 > 旧写死路径 的顺序取第一个真实存在的。
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PARENT_DIR = os.path.dirname(BASE_DIR)
 
 
 def _pick_path(env_name, kind, *candidates):
-    """返回第一个真实存在的候选路径；都不存在时返回第一个候选，便于报错显示。"""
     env_value = (os.getenv(env_name) or "").strip()
     if env_value:
         return os.path.abspath(os.path.expanduser(env_value))
@@ -87,13 +55,6 @@ def _pick_path(env_name, kind, *candidates):
 
 
 def _pick_audio_device():
-    """自动选音频设备：优先 USB 声卡，其次板载声卡（直连 ALSA）。
-
-    设备选择：早期版本固定使用 plughw:0,0，设备不存在时播放直接失败。
-    使用 "default" 会经过 PipeWire，重启后偶尔只生成
-          "Dummy Output"，声音全进虚空，程序还以为播成功了。
-          所以这里直接绑到 /proc/asound/cards 里的真实声卡。
-    """
     env = (os.getenv("BAYMAX_AUDIO_DEVICE") or "").strip()
     if env:
         return env
@@ -117,18 +78,13 @@ def _pick_audio_device():
 
 
 AUDIO_DEVICE = _pick_audio_device()
-# 录音与放音可以是两台设备（例如：USB 麦克风 + 蓝牙音箱）。
-# 不显式指定时两者都沿用 AUDIO_DEVICE。
 INPUT_DEVICE = (os.getenv("BAYMAX_INPUT_DEVICE") or "").strip() or AUDIO_DEVICE
 OUTPUT_DEVICE = (os.getenv("BAYMAX_OUTPUT_DEVICE") or "").strip() or AUDIO_DEVICE
 
-# 板载 ES8326 只接受 48kHz 立体声；缓存语音是 24kHz 单声道，
-# 直接 aplay 会 "无法安装hw参数"。这里按需用 ffmpeg 转一份。
 _PLAY_CACHE = {}
 
 
 def _ensure_playable(path):
-    """返回一个能被声卡直接播放的 wav 路径（必要时转成 48k 立体声）。"""
     try:
         import wave
         with wave.open(path, "rb") as w:
@@ -181,10 +137,8 @@ KWS_MODEL_DIR = _pick_path(
 LLM_API_URL = "http://127.0.0.1:8080/v1/chat/completions"
 LLM_HEALTH_URL = "http://127.0.0.1:8080/health"
 LLM_MODELS_URL = "http://127.0.0.1:8080/v1/models"
-# 用于启动时核对服务端模型；可通过 BAYMAX_LLM_EXPECTED_MODEL 覆盖。
 LLM_EXPECTED_MODEL_HINT = os.getenv("BAYMAX_LLM_EXPECTED_MODEL", "Qwen2.5-0.5B")
 def _add_punctuation(text):
-    """给 ASR 结果自动加标点"""
     if not text:
         return text
     t = text.strip()
@@ -216,7 +170,6 @@ KWS_READ_TIMEOUT = 0.2
 TTS_QUEUE_MAXSIZE = 10
 
 
-# ==================== 2.0 调优参数 ====================
 def _env_float(name, default):
     try:
         return float(os.getenv(name, default))
@@ -224,29 +177,21 @@ def _env_float(name, default):
         return float(default)
 
 
-# 唤醒灵敏度：阈值 0.15 -> 0.10、得分 1.0 -> 1.2，唤醒更快（误唤醒略增）。
 KWS_THRESHOLD = _env_float("BAYMAX_KWS_THRESHOLD", 0.10)
 KWS_SCORE = _env_float("BAYMAX_KWS_SCORE", 1.2)
-# 唤醒后开麦前的等待，原为固定 0.5s，这里降到 0.15s。
 RECORD_WARMUP = _env_float("BAYMAX_RECORD_WARMUP", 0.15)
-# 急救快速模式：只播已缓存的短句，绝不等 ZipVoice 现场合成。
 EMERGENCY_FAST = (os.getenv("BAYMAX_EMERGENCY_FAST", "1") or "1").strip() != "0"
-# 这句在 common_phrases.jsonl 里已预生成，命中即秒出声。
 URGENT_CACHE_TEXT = "如果出现紧急情况，请立即拨打幺二零。"
-# 命中规则只看关键词且限短句，避免误吞正常的健康问题。
 SMALLTALK = [
     (("你是谁", "你叫什么", "介绍一下自己", "你是什么"), "我是大白，您的健康陪护助手。"),
     (("你会什么", "你能做什么", "有什么功能", "能干什么", "会做什么"),
      "我可以提醒吃药、记录血压，摔倒时帮您通知家人。"),
     (("谢谢", "多谢", "辛苦了"), "不客气，您有事随时叫我。"),
-    # 应答类：缓存里已有这些句子，不该让大模型现编（又慢又跑题）
     (("知道了", "明白了", "懂了", "晓得了", "嗯好的", "嗯我明白", "我知道了"), "好的，我知道了。"),
     (("嗯", "哦", "好", "行", "嗯嗯", "对对"), "好的，我知道了。"),
 ]
-# 外设总开关，置 0 则完全不加载 MPU6050 / 4G / 摄像头。
 SENSORS_ENABLED = (os.getenv("BAYMAX_SENSORS", "1") or "1").strip() != "0"
 
-# ---- 外设模块（可选）：MPU6050 跌倒 / EC20 短信 / 摄像头 ----
 sensors = None
 if SENSORS_ENABLED:
     try:
@@ -255,7 +200,6 @@ if SENSORS_ENABLED:
         sensors = None
         print(f"⚠️ 外设模块未加载（不影响语音）：{_e}")
 
-# ---- 服务层（健康档案 / 用药提醒 / 面板指令）：可选，缺了也能说话 ----
 service = None
 try:
     import baymax_service as service
@@ -263,7 +207,6 @@ except Exception as _e:
     service = None
     print(f"⚠️ 服务模块未加载（不影响语音）：{_e}")
 
-# ---- 健康数据层（语音报数值 -> 建档 -> 阈值提示）：纯软件，不依赖传感器开关 ----
 health = None
 try:
     import baymax_health as health
@@ -276,7 +219,6 @@ _hub = None
 _last_question = ""
 _last_answer = ""
 
-# 闭环控制器：感知 → 评估 → 决策 → 执行 → 反馈 → 记录
 try:
     import baymax_loop
 except Exception as _e:
@@ -284,11 +226,10 @@ except Exception as _e:
     print(f"⚠️ 闭环引擎未加载（退回单点告警）：{_e}")
 _loop = baymax_loop.ClosedLoop() if baymax_loop is not None else None
 _last_fall_g = 0.0
-last_spoken_text = ""   # 最近一次真正播出去的文案
+last_spoken_text = ""
 _disclaimer_spoken = False
 _listening_shown = False
 
-# ==================== 本地医疗词典 ====================
 LOCAL_MEDICAL_ADVICE = {
     "高血压": "高血压患者每天盐别超过五克，少吃咸菜和腌制品。按时吃降压药，每天定时量血压。",
     "糖尿病": "糖尿病要少吃甜的，主食粗细搭配。按时吃药，定期测血糖，脚上有伤口要及时处理。",
@@ -307,9 +248,6 @@ MEDICAL_TRIGGERS = [
 ]
 
 
-# ==================== 本地医疗知识检索（v17.0） ====================
-# 采用 JSONL 本地知识库 + 轻量中文关键词/字 n-gram 检索，不增加 K1 依赖。
-# 这是可离线运行的第一阶段检索，不声称等同于向量语义检索；知识条目须经审核后再用于正式演示。
 KB_PATH = _pick_path(
     "BAYMAX_KB_PATH", "file",
     os.path.join(BASE_DIR, "medical_knowledge.jsonl"),
@@ -351,9 +289,7 @@ _kb_cache = None
 _kb_load_error = None
 
 def _kb_tokenize(text):
-    """无需 jieba 的中文轻量分词：保留显式关键词并提取字符二元组。"""
     text = _normalize_text(text)
-    # 拉丁/数字词及中文连续串
     words = re.findall(r"[a-z0-9]+|[\u4e00-\u9fff]+", text)
     tokens = set(words)
     for word in words:
@@ -362,7 +298,6 @@ def _kb_tokenize(text):
     return tokens
 
 def load_medical_kb(force_reload=False):
-    """加载内置条目并合并外部 JSONL；外部条目以 id 去重覆盖。"""
     global _kb_cache, _kb_load_error
     with _kb_lock:
         if _kb_cache is not None and not force_reload:
@@ -403,7 +338,6 @@ def load_medical_kb(force_reload=False):
         return list(_kb_cache)
 
 def _keyword_is_explicitly_negated(query_norm, keyword):
-    """仅过滤明确否定的关键词；教学/假设性提问仍可检索相关知识。"""
     key = _normalize_text(str(keyword))
     if not key:
         return False
@@ -417,7 +351,6 @@ def _keyword_is_explicitly_negated(query_norm, keyword):
         search_from = idx + len(key)
         prefix = _clause_prefix(query_norm, idx)
         suffix = query_norm[idx + len(key):idx + len(key) + 8]
-        # 不把“会不会胸痛”中的疑问词“不会”误当成症状否定。
         retrieval_negations = ("没有", "没", "不再", "不用", "无需", "不是", "并非", "不需要", "从来没有", "已经没有", "没有再")
         has_negation = any(term in prefix[-8:] for term in retrieval_negations)
         if "会不会" in prefix[-8:] and not any(term in prefix[-8:] for term in ("没有", "不再", "不用", "无需", "不是", "并非", "不需要")):
@@ -433,7 +366,6 @@ def _is_numeric_only_keyword(keyword):
     return bool(re.fullmatch(r"\d+", str(keyword).strip()))
 
 
-# 问题类型识别：同一个主题问「是什么 / 为什么 / 怎么办」，要给出不同答案。
 _KIND_DEF_WORDS = ("什么是", "是什么", "啥是", "啥叫", "什么叫", "定义", "指的是", "指什么", "是什么意思")
 _KIND_WHY_WORDS = ("为什么", "为啥", "原因", "怎么得", "怎么引起", "怎么回事", "诱因", "病因",
                    "怎么来的", "什么导致", "怎么会")
@@ -442,11 +374,9 @@ _KIND_HOW_WORDS = ("怎么办", "怎么治", "怎么管", "注意什么", "要�
 
 
 def detect_question_kind(text):
-    """返回 what / why / how / None（None 表示没问清楚，默认按怎么办答）。"""
     if not text:
         return None
     t = _normalize_text(text)
-    # 顺序很重要：先判"是什么"，否则"为什么血压高怎么办"这类会被 how 抢先
     for w in _KIND_DEF_WORDS:
         if w in t:
             return "what"
@@ -460,7 +390,6 @@ def detect_question_kind(text):
 
 
 def retrieve_medical_knowledge(query, top_k=KB_TOP_K):
-    """轻量混合关键词检索，返回命中条目与透明分数；不伪装成向量相似度。"""
     if not query or not query.strip():
         return []
     query_norm = _normalize_text(query)
@@ -482,24 +411,17 @@ def retrieve_medical_knowledge(query, top_k=KB_TOP_K):
             keyword_norm = _normalize_text(keyword_text)
             if not keyword_norm or keyword_norm not in query_norm:
                 continue
-            # 裸数字“120”会误匹配血压 120/80 等数值；只有明确急救语境才接受。
             if _is_numeric_only_keyword(keyword_text) and not emergency_context:
                 continue
-            # “我没有胸痛，但喘不上气”不应把“胸痛”条目当作当前症状命中。
             if _keyword_is_explicitly_negated(query_norm, keyword_norm):
                 continue
             explicit_hits.append(keyword_text)
-        # 标题命中：用真正匹配到的关键词去比标题。
-        # 原实现把整个标题当一个词去比，基本永远不命中，导致"高血压"被"血压"泛词压过去。
         title_hits = [kw for kw in explicit_hits if kw and kw in title]
         corpus_tokens = _kb_tokenize(" ".join([title, content, " ".join(map(str, keywords))]))
         overlap = len(query_tokens & corpus_tokens)
-        # 显式关键词权重高；字符二元组仅用于排序，避免把低重合误当成强命中。
         score = len(explicit_hits) * 3.0 + len(title_hits) * 1.5 + min(overlap, 8) * 0.15
         if explicit_hits:
             score += min(max((len(_normalize_text(k)) for k in explicit_hits), default=0), 6) * 0.15
-        # 「是什么 / 为什么 / 怎么办」分流：命中同主题时，按问法类型加权。
-        # 没有明确问法时默认偏向"怎么办"——这是老人最常问的。
         item_kind = item.get("kind")
         if intent_kind:
             if item_kind == intent_kind:
@@ -549,7 +471,6 @@ EMERGENCY_KEYWORDS = [
     "叫救护车", "摔倒爬不起来", "跌倒后无法起身"
 ]
 
-# 仅用于避免明显的否定/假设句误触发；不能替代完整的临床语义理解。
 NEGATION_TERMS = (
     "没有", "没", "不", "别", "无需", "不是", "不用", "并非",
     "不需要", "从来没有", "已经没有", "没有再"
@@ -572,7 +493,6 @@ def _normalize_text(text):
 
 
 def _is_negated_occurrence(text, keyword):
-    """检查关键词左侧短窗口内是否有明显否定词。中文语义边界仍需测试。"""
     normalized = _normalize_text(text)
     start = 0
     while True:
@@ -580,7 +500,6 @@ def _is_negated_occurrence(text, keyword):
         if idx < 0:
             return False
         prefix = normalized[max(0, idx - 8):idx]
-        # 处理“没有胸痛”“不再胸痛”等常见否定。
         if any(term in prefix for term in NEGATION_TERMS):
             start = idx + len(keyword)
             continue
@@ -588,7 +507,6 @@ def _is_negated_occurrence(text, keyword):
 
 
 def _clause_prefix(normalized, idx):
-    """返回当前短分句的前文，避免前一句的否定/历史词误伤后一句。"""
     separators = ("，", ",", "。", ".", "；", ";", "！", "!", "？", "?", "但是", "但", "可是", "不过", "而现在")
     left = 0
     for sep in separators:
@@ -608,7 +526,6 @@ def _occurrence_is_negated_or_contextual(normalized, idx):
 
 
 def contains_explicit_emergency_request(text):
-    """识别明确要求呼叫急救的表达，避免“什么时候叫救护车”触发报警。"""
     normalized = _normalize_text(text)
     if not normalized:
         return False
@@ -627,7 +544,6 @@ def contains_explicit_emergency_request(text):
             prefix = _clause_prefix(normalized, idx)
             if any(term in prefix[-10:] for term in ("没有", "不是", "并非", "不需要", "不用", "别", "不要")):
                 continue
-            # 否定/假设提问不等于当前求助；但有明确“现在”症状时仍由症状规则兜底。
             if any(term in prefix[-12:] for term in ("什么时候", "什么情况下", "怎么才", "是否要", "需不需要")):
                 continue
             return True
@@ -639,7 +555,6 @@ def contains_high_risk_symptom(text):
         return False
     normalized = _normalize_text(text)
 
-    # 对纯知识问句降低误报；若出现明确的当前症状语境，仍走急症兜底。
     educational_markers = ("是什么", "什么意思", "指什么", "有哪些原因", "科普", "定义", "如何预防", "怎么预防", "什么时候叫救护车", "什么时候拨打120", "什么情况下拨打120")
     current_markers = ("我现在", "现在我", "我突然", "突然出现", "正在", "此刻", "目前", "刚刚", "我有", "我出现", "我感觉", "正在发生")
     if (any(marker in normalized for marker in educational_markers)
@@ -647,8 +562,6 @@ def contains_high_risk_symptom(text):
             and not contains_explicit_emergency_request(normalized)):
         return False
 
-    # 急症求助词也按具体出现位置检查，避免“没有喘不上气”被误判；
-    # 采用分句上下文，避免“以前胸痛，但现在胸痛”漏报当前症状。
     keywords = tuple(MEDICAL_SAFETY_HIGH_RISK) + (
         "救命", "救救我", "sos", "我不行了"
     )
@@ -672,7 +585,6 @@ def contains_high_risk_symptom(text):
 
 
 def is_negative_sentence(text):
-    """对紧急求助关键词逐次、分句检查；含糊情况仍按求助处理。"""
     normalized = _normalize_text(text)
     if not normalized:
         return True
@@ -703,14 +615,12 @@ def parse_notify_consent(reply):
     return None
 
 
-# ==================== 紧急通知 ====================
 _last_emergency_success_time = 0.0
 EMERGENCY_COOLDOWN = 60.0
 _emergency_lock = threading.Lock()
 
 
 def build_alert_markdown(reason, detail="", photo_url=None, actions=""):
-    """钉钉告警正文：结构化，便于家属一眼看清发生了什么。"""
     lines = [
         "### 🚨 紧急求助 · 大白检测到%s" % reason,
         "",
@@ -718,7 +628,6 @@ def build_alert_markdown(reason, detail="", photo_url=None, actions=""):
         "**设备**：K1 健康陪护终端（%s）" % _local_ip(),
     ]
     if detail:
-        # detail 里用"；"分隔条目、用"｜"分隔字段，这里拆成一行一个字段
         for part in [p.strip() for p in detail.split("；") if p.strip()]:
             for field in [f.strip() for f in part.split("｜") if f.strip()]:
                 if "：" in field:
@@ -764,7 +673,6 @@ def trigger_emergency(reason="语音触发", markdown=None):
         return "failed"
 
 
-# ==================== 全局状态与工具 ====================
 _stdout_lock = threading.Lock()
 wake_event = threading.Event()
 shutdown_event = threading.Event()
@@ -806,7 +714,6 @@ def terminate_process(proc, timeout=1.0):
         print(f"⚠️ 清理子进程时发生异常：{e}")
 
 
-# ==================== 音频管理 ====================
 class AudioManager:
     def __init__(self):
         self.cond = threading.Condition()
@@ -815,7 +722,6 @@ class AudioManager:
         self.stopped = False
 
     def pause_kws(self, timeout=2.0):
-        # 先在条件锁内标记暂停并取出进程引用，之后在锁外终止进程。
         with self.cond:
             self.kws_paused = True
             self.cond.notify_all()
@@ -874,7 +780,6 @@ class AudioManager:
 
 audio_mgr = AudioManager()
 
-# ==================== TTS 引擎 ====================
 class TTSTask:
     def __init__(self, text, generation):
         self.text = text
@@ -898,16 +803,13 @@ VOICE_CACHE_ROOT = _pick_path(
     "/home/baymax/voice_cache_staging_v2/voice_cache_payload_v2",
 )
 
-# 【短版缓存】25 条知识的口语短句 + 场景应答，3-6 秒一条。
-# 为什么单独做一套：K1 上 ZipVoice 实时率约 15x，现场合成一句要 45 秒，
-# 而知识全文音频有 27 秒，老人听不完。短版命中即秒出声。
 SHORT_CACHE_ROOT = _pick_path(
     "BAYMAX_SHORT_CACHE", "dir",
     os.path.join(BASE_DIR, "voice_cache_staging_v2", "short_cache"),
     os.path.join(PARENT_DIR, "voice_cache_staging_v2", "short_cache"),
     os.path.expanduser("~/voice_cache_staging_v2/short_cache"),
 )
-import hashlib  # 短版缓存按文本 sha256 索引
+import hashlib
 
 _short_index = None
 _short_by_id = {}
@@ -915,7 +817,6 @@ _short_lock = threading.Lock()
 
 
 def _load_short_index():
-    """懒加载短版清单：sha256(文本) -> 记录。"""
     global _short_index, _short_by_id
     with _short_lock:
         if _short_index is not None:
@@ -940,7 +841,6 @@ def _load_short_index():
 
 
 def resolve_short_cache(text):
-    """按文本全文命中预生成短音频；任何异常一律视为未命中。"""
     if not isinstance(text, str) or not text:
         return None
     index = _load_short_index()
@@ -955,7 +855,6 @@ def resolve_short_cache(text):
 
 
 def short_text_for(item_id):
-    """取某条知识的口语短版文案；没有就返回空串。"""
     if not item_id:
         return ""
     _load_short_index()
@@ -963,7 +862,6 @@ def short_text_for(item_id):
 
 
 def resolve_common_voice_cache(text):
-    """仅精确匹配已登记的固定常用语；异常、校验失败均视为未命中。"""
     import hashlib
     import json
     import wave
@@ -985,7 +883,6 @@ def resolve_common_voice_cache(text):
         if not isinstance(records, dict):
             return None
 
-        # 只查找与文本完全一致的条目。
         matched_id = None
         with open(phrases_path, "r", encoding="utf-8") as phrases_file:
             for line in phrases_file:
@@ -1019,9 +916,6 @@ def resolve_common_voice_cache(text):
         if os.path.dirname(wav_path) != wav_root or not os.path.isfile(wav_path):
             return None
 
-        # WAV 必须与清单登记的参数一致：16-bit PCM、非空、声道/采样率与记录相符。
-        # （早期版本写死 24kHz 单声道，后来为直连板载声卡统一转成 48kHz 立体声，
-        #   所以这里改为以清单为准，两种格式都能命中。）
         with wave.open(wav_path, "rb") as wf:
             if (
                 wf.getsampwidth() != 2
@@ -1040,10 +934,8 @@ def resolve_common_voice_cache(text):
         return wav_path
     except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError, wave.Error):
         return None
-# ===== 固定常用语 WAV 缓存新增结束 =====
 
 def resolve_medical_voice_cache(text):
-    """仅精确匹配已登记的医疗知识原文；校验摘要、路径及 WAV 格式。"""
     import hashlib
     import json
     import wave
@@ -1067,7 +959,6 @@ def resolve_medical_voice_cache(text):
         if not isinstance(records, dict):
             return None
 
-        # 必须以完整 content 精确匹配，不做关键词或模糊匹配。
         matched_item = None
         with open(knowledge_path, "r", encoding="utf-8") as f:
             for line in f:
@@ -1117,7 +1008,6 @@ def resolve_medical_voice_cache(text):
             ):
                 return None
 
-            # 清单中的音频参数也必须与实际 WAV 一致。
             if (
                 record.get("channels") != wf.getnchannels()
                 or record.get("sample_rate") != wf.getframerate()
@@ -1136,7 +1026,6 @@ def resolve_medical_voice_cache(text):
 
 
 def resolve_any_voice_cache(text):
-    """常用语 -> 短版知识/场景 -> 知识全文，依次尝试。"""
     path = resolve_common_voice_cache(text)
     if path is not None:
         return path
@@ -1186,7 +1075,6 @@ def init_tts_model():
 
 
 def enqueue_tts(text):
-    """缓存精确命中或模型可用时才入队；成功入队后才增加任务计数。"""
     global _active_tts_tasks
     if not text or not text.strip():
         return False
@@ -1240,11 +1128,9 @@ def tts_worker():
             if cancelled_before_start:
                 continue
 
-            # 先尝试缓存；缓存命中不调用 ZipVoice。
             play_wav = resolve_any_voice_cache(task.text)
 
             if play_wav is None:
-                # 未命中才走原有合成路径。
                 if _tts_model is None:
                     continue
 
@@ -1256,7 +1142,6 @@ def tts_worker():
                 if task.cancel.is_set() or shutdown_event.is_set():
                     continue
 
-                # sherpa-onnx 是 C++ 库，会往 stderr 打 "Creating a resampler…" 之类的日志，
                 with suppress_stderr():
                     audio = _tts_model.generate(
                         task.text,
@@ -1291,8 +1176,6 @@ def tts_worker():
                 continue
             play_wav = _ensure_playable(play_wav)
 
-            # 输入输出是两台设备时（USB 麦克风 + 蓝牙音响），播放和录音互不影响，
-            # 不必再抢同一把音频锁；否则录音先抢到锁会把正在排队的播报直接丢掉。
             if INPUT_DEVICE != OUTPUT_DEVICE:
                 print("%s  ▶ 播放 %s%s" % (C_GRAY, os.path.basename(play_wav), C_RESET))
             else:
@@ -1340,7 +1223,6 @@ def tts_worker():
             if acquired_audio:
                 audio_mgr.release("play")
 
-            # 只删除本任务生成的临时 WAV，绝不删除缓存 WAV。
             if generated_wav:
                 try:
                     os.remove(generated_wav)
@@ -1359,13 +1241,9 @@ def tts_worker():
 
 
 def stop_speech():
-    """取消当前代次，并清空排队任务；不声称能中断正在执行的模型推理。"""
     global _current_player, _tts_generation, _active_tts_tasks
     with _tts_idle_cond:
         _tts_generation += 1
-        # 修复：不在 C++ 推理期间强行取消，避免底层 ONNX 崩溃
-        # if _current_tts_task is not None:
-        #     _current_tts_task.cancel.set()
 
         while True:
             try:
@@ -1402,18 +1280,16 @@ def wait_tts_finish(timeout=15.0):
         return player is None or player.poll() is not None
 
 
-# ==================== 录音与 ASR ====================
 def record_audio(wav_path, max_duration=6, silence_timeout=1.3):
     if not ASR_OK or shutdown_event.is_set(): return False
-    # 先把正在播的话放完，否则录音一抢到音频锁，播报就会被丢掉
     _wait = time.monotonic() + 15.0
     while time.monotonic() < _wait:
         with _tts_idle_cond:
             if _active_tts_tasks <= 0:
                 break
         time.sleep(0.1)
-    time.sleep(RECORD_WARMUP)  # 唤醒后开麦前的小停顿
-    time.sleep(0.3)            # 等音响余音散掉，减少自问自答
+    time.sleep(RECORD_WARMUP)
+    time.sleep(0.3)
     if not audio_mgr.acquire("record", timeout=5.0): 
         print("\n❌ [录音] 麦克风设备被其他进程占用")
         return False
@@ -1488,7 +1364,7 @@ def record_audio(wav_path, max_duration=6, silence_timeout=1.3):
                 _dur = len(locals().get('frames', [])) * 0.03
                 sys.stdout.write("\r%s   ● 录音 %.1fs%s\n" % (C_GRAY, _dur, C_RESET))
             else:
-                pass  # 没检测到语音就不打印，避免刷屏
+                pass
             sys.stdout.flush()
         
         if proc:
@@ -1523,7 +1399,6 @@ def safe_recognize(wav_path):
         return ""
 
 
-# ==================== KWS 唤醒 ====================
 kws_ready = threading.Event()
 kws_error = None
 
@@ -1658,7 +1533,6 @@ def wake_listener():
         time.sleep(0.05)
 
 
-# ==================== 交互与安全处理 ====================
 _EMERGENCY_STATUS_TEXT = {
     "sent": "求助消息已发送到通知群，请同时拨打120。",
     "cooldown": "刚刚已尝试发送求助通知，请直接拨打120。",
@@ -1668,7 +1542,6 @@ _EMERGENCY_STATUS_TEXT = {
 
 
 def handle_emergency_status(status):
-    """播报通知结果。快速模式下只打印，不排长句合成，避免堵住急救链路。"""
     msg = _EMERGENCY_STATUS_TEXT.get(status, _EMERGENCY_STATUS_TEXT["failed"])
     print(f"📣 {msg}")
     if EMERGENCY_FAST:
@@ -1677,22 +1550,16 @@ def handle_emergency_status(status):
 
 
 def speak_urgent_cached():
-    """播放已缓存的急救短句：命中即秒出声，不依赖现场合成。"""
     return enqueue_tts(URGENT_CACHE_TEXT)
 
 
 def tight_emergency(reason):
-    """急症/跌倒的快速通道：先出声，再通知，绝不等合成。"""
     if not speak_urgent_cached():
         print("⚠️ [急救] 语音缓存不可用，请直接拨打120或请身边人帮忙。")
     handle_emergency_status(trigger_emergency(reason))
 
 
 def handle_medical_safety(text):
-    """
-    先提示急症处置，再将通知家人作为可选操作。
-    播报超时不会阻止程序继续处理；实际紧急情况下不要等待本程序。
-    """
     if not contains_high_risk_symptom(text):
         return False
 
@@ -1702,8 +1569,6 @@ def handle_medical_safety(text):
     )
     print(f"\n🚨 [医疗安全提示] {urgent_message}")
     if EMERGENCY_FAST:
-        # 这句完整提示在 K1 上现场合成要 30~100 秒，急症等不起：
-        # 改播已缓存的短句并直接通知家人，完整文字仍在屏幕上。
         tight_emergency("高风险症状")
         return True
     if not enqueue_tts(urgent_message):
@@ -1713,12 +1578,9 @@ def handle_medical_safety(text):
         print("⚠️ [医疗安全] 紧急提示未能及时播完；不继续占用麦克风询问授权。")
         return True
 
-    # 先确认急症提示确实播完，再询问是否尝试通知家属。
     if shutdown_event.is_set():
         return True
         
-    # 明确求助（"救命/帮我叫救护车"）也先问一句再拨号，避免误触发电话。
-    # 后续统一走"询问 → 听回答 → 同意才拨"的流程。
     print("%s▌需要通知家里人%s" % (C_CYAN, C_RESET))
     if not enqueue_tts("如果方便，我可以尝试通知家里人。"):
         print("⚠️ [医疗安全] 无法播报家属通知询问；请直接拨打120或请身边人帮忙。")
@@ -1745,7 +1607,6 @@ def handle_medical_safety(text):
         consent = parse_notify_consent(reply)
         if consent is True:
             handle_emergency_status(trigger_emergency("高风险症状"))
-            # 用户已同意 → 立刻拨号（4G）
             try:
                 if sensors is not None:
                     _ok, _msg = sensors.place_call()
@@ -1772,22 +1633,16 @@ _latency = {}
 
 
 def match_smalltalk(text):
-    """闲聊兜底：返回已预生成语音的回复文案，没有则 None。
-
-    只在短句上生效，避免"谢谢，我血压150 90"这类被误吞掉。
-    """
     if not text or len(text) > 12 or re.search(r"\d", text):
         return None
     for keys, reply in SMALLTALK:
         for k in keys:
-            # 单字关键词只做全等匹配，避免"好"把"我身体好"也吞掉
             if k == text or (len(k) > 1 and k in text):
                 return reply
     return None
 
 
 def _local_ip():
-    """取本机局域网 IP，用于在告警里拼照片链接。"""
     try:
         import socket as _s
         s = _s.socket(_s.AF_INET, _s.SOCK_DGRAM)
@@ -1800,18 +1655,15 @@ def _local_ip():
 
 
 def _set_answer(text):
-    """安全地写全局 _last_answer（避免在函数中间出现 global 声明）。"""
     global _last_answer
     _last_answer = text
 
 
-# 卡片式输出：每轮对话用框线包起来，时延单独一行，画面干净有层次。
 UI_WIDTH = int(os.getenv("BAYMAX_UI_WIDTH", "58"))
 UI_PLAIN = (os.getenv("BAYMAX_UI", "card") or "card").strip().lower() == "plain"
 
 
 def _wrap_cn(text, width):
-    """按显示宽度折行（中文算 2 列）。"""
     lines = []
     for raw in str(text).splitlines():
         if not raw:
@@ -1832,17 +1684,14 @@ def _wrap_cn(text, width):
 
 
 def _disp_width(text):
-    """显示宽度：中文和制表符算 2 列。"""
     return sum(2 if ord(ch) > 0x2E80 else 1 for ch in str(text))
 
 
 def _hline(head, width):
-    """把 '╭─ 标题 ' 补足到指定显示宽度。"""
     pad = width - _disp_width(head)
     return head + "─" * max(0, pad)
 
 
-# ---------------- HUD 风格（参考片同款） ----------------
 _USE_COLOR = sys.stdout.isatty() and (os.getenv("BAYMAX_NO_COLOR", "0") or "0").strip() != "1"
 C_RESET = "\033[0m" if _USE_COLOR else ""
 C_DIM = "\033[2m" if _USE_COLOR else ""
@@ -1859,7 +1708,6 @@ def _pad(text, width):
 
 
 def ui_chip(label, seconds=None, width=20):
-    """HUD 状态行：▌聆听中   用一条竖线做标记，比括号连线干净。"""
     sec = ("  %.1fs" % seconds) if seconds is not None else ""
     bar = ""
     if seconds is not None:
@@ -1869,12 +1717,10 @@ def ui_chip(label, seconds=None, width=20):
 
 
 def ui_user(text):
-    """HUD：我: …"""
     print("%s我:%s %s" % (C_DIM, C_RESET, text))
 
 
 def ui_bot(text, tag=None):
-    """HUD：大白: …（tag 用灰色小字跟在行尾，不打断画面）"""
     suffix = ("   %s[%s]%s" % (C_GRAY, tag, C_RESET)) if tag else ""
     lines = str(text).splitlines() or [""]
     print("")
@@ -1885,14 +1731,12 @@ def ui_bot(text, tag=None):
 
 
 def ui_meta(text):
-    """时延明细：默认只在调试时显示，可用 BAYMAX_UI_META=0 关闭。"""
     if (os.getenv("BAYMAX_UI_META", "1") or "1").strip() == "0":
         return
     print("%s      ⏱  %s%s" % (C_GRAY, text, C_RESET))
 
 
 def ui_boot(modules, ready_line="环境就绪，大白已上线"):
-    """参考片同款：四列分组启动自检。"""
     col_w = 24
     print("%s[系统] 正在检测运行环境…%s" % (C_GREEN, C_RESET))
     print("")
@@ -1914,7 +1758,6 @@ def ui_boot(modules, ready_line="环境就绪，大白已上线"):
 
 
 def _finish_turn(extra=None):
-    """打印一轮交互的时延分解，可直接写进测试报告。"""
     if not _latency:
         return
     start = _latency.get("turn_start")
@@ -1945,16 +1788,9 @@ def _finish_turn(extra=None):
 
 
 def stream_llm_and_speak(question, retrieved=None):
-    """调用本机 OpenAI 兼容接口，并输出可复核的端到端计时。
-
-    注意：首内容块延迟不是纯模型首 token 延迟；输出字符数也不是 token 数。
-    如需 token/s，请使用 llama-server 的原生 benchmark/日志数据。
-    """
     if not question or shutdown_event.is_set():
         return False
 
-    # 没命中缓存时先给一句即时反馈：K1 上 ZipVoice 约 15 倍实时率，
-    # 一条 20 字的回答要现场合成 30 秒以上，先出声避免现场冷场。
     if not shutdown_event.is_set():
         enqueue_tts("稍等一下，我来帮您查查。")
 
@@ -2022,8 +1858,6 @@ def stream_llm_and_speak(question, retrieved=None):
                 with _stdout_lock:
                     sys.stdout.write(word)
                     sys.stdout.flush()
-                # 修改：此处不再分句送 TTS，避免和 LLM 抢占 CPU 算力
-                # 等循环结束后，一次性把完整文本送给 TTS
             except (ValueError, KeyError, IndexError, TypeError):
                 continue
 
@@ -2053,19 +1887,10 @@ def stream_llm_and_speak(question, retrieved=None):
 
 
 def wait_or_interrupt(timeout=30.0):
-    """等播报结束，期间按任意键立刻打断。
-
-    返回 "done"（正常播完）/ "key"（被按键打断）/ "timeout"（超时仍在播）。
-    原来固定 wait_tts_finish(90.0)，老人只能干等 27 秒，插话也没用。
-    """
     deadline = time.monotonic() + timeout
     fd, old = None, None
     try:
         cand = sys.stdin.fileno()
-        # 只有真正的终端才把 stdin 当作“按键打断”的来源。
-        # 后台运行（nohup / systemd / </dev/null）时 stdin 已经是 EOF，
-        # select() 会一直报告“可读”，于是 EOF 被误判成按键，
-        # 播报一开口就被 stop_speech() 掐掉——表现为“缓存命中了却没声音”。
         if os.isatty(cand):
             fd = cand
             old = termios.tcgetattr(fd)
@@ -2073,8 +1898,6 @@ def wait_or_interrupt(timeout=30.0):
     except Exception:
         fd = None
     try:
-        # 任务刚入队、worker 还没取走时 _active_tts_tasks 仍是 0，
-        # 直接判"播完"会让后面的录音抢到音频锁，把这句话掐掉。
         grace = time.monotonic() + 2.0
         while time.monotonic() < grace:
             with _tts_idle_cond:
@@ -2098,7 +1921,6 @@ def wait_or_interrupt(timeout=30.0):
                     key = sys.stdin.read(1)
                 except Exception:
                     key = ""
-                # 读到空串说明是 EOF（终端已关闭），不能当成“用户按了键”。
                 if not key:
                     fd = None
                     continue
@@ -2115,13 +1937,10 @@ def wait_or_interrupt(timeout=30.0):
 
 
 MEDICAL_CACHE_FIRST = (os.getenv("BAYMAX_MEDICAL_CACHE_FIRST", "1") or "1").strip() != "0"
-# 短版语音（short_wav/）是后来用 ZipVoice 批量合成的，音色和用户配置的不一致，
-# 默认关闭。置 BAYMAX_SHORT_SPEECH=1 才会在全文缓存缺失时兜底使用。
 SHORT_SPEECH_ENABLED = (os.getenv("BAYMAX_SHORT_SPEECH", "0") or "0").strip() != "0"
 
 
 def speak_cached_medical(retrieved):
-    """命中预生成语音就直接播知识库原文（用户配置的那份音色与文案）。"""
     if not MEDICAL_CACHE_FIRST or not retrieved:
         return False
     item = retrieved[0].get("item") or {}
@@ -2131,9 +1950,6 @@ def speak_cached_medical(retrieved):
         return False
 
     speak_text, kind = None, ""
-    # 优先播知识库全文：medical_wav/ 与 common_wav/ 是同一套参考音色
-    # （qwen-talker-1.7b，reference_wav_sha256=0c118f39…），也就是用户配置的音色。
-    # short_wav/ 是另一套引擎合成的短句，音色对不上，默认不再使用。
     if resolve_medical_voice_cache(content):
         speak_text, kind = content, "全文"
     elif SHORT_SPEECH_ENABLED:
@@ -2158,7 +1974,6 @@ def speak_cached_medical(retrieved):
             _service.bump_metric("cache_hits")
         except Exception:
             pass
-    # 等播放结束再开麦克风，避免把自己的外放录进去；期间按任意键可打断。
     wait_or_interrupt(20.0 if kind == "短版" else 35.0)
     return True
 
@@ -2174,7 +1989,6 @@ def run_session(wake_ack=False):
         return
 
     try:
-        # KWS唤醒后先应答，等待播报完成再开始录音。
         if wake_ack and not shutdown_event.is_set():
             response = "我在呢，您说。"
             ui_bot(response, tag="唤醒应答")
@@ -2201,7 +2015,6 @@ def run_session(wake_ack=False):
             else:
                 print("⚠️ [唤醒应答] 语音未能加入播放队列")
 
-            # 免责声明：每次上电只主动说一次，文字 + 语音都要有
             global _disclaimer_spoken
             if not _disclaimer_spoken and (os.getenv("BAYMAX_DISCLAIMER", "1") or "1").strip() != "0":
                 _disclaimer_spoken = True
@@ -2248,11 +2061,9 @@ def run_session(wake_ack=False):
                 if not raw_text:
                     continue
 
-                # 有效识别到语音后，刷新连续对话的 60 秒期限。
                 deadline = time.monotonic() + 60
-                _mood_touch()          # 有人说话就算"有互动"，重置关怀计时
+                _mood_touch()
 
-                # 闭环反馈：上一轮告警还在窗口期内，用户一句话就能取消或升级
                 if _loop is not None and _loop.pending is not None:
                     try:
                         _fb = _loop.feedback(raw_text)
@@ -2275,7 +2086,6 @@ def run_session(wake_ack=False):
 
                 compact = compact_text(raw_text)
 
-                # 只匹配句首唤醒词，避免按压缩后的字符数截断原文。
                 import re as _re
                 wake_pattern = _re.compile(
                     r'^\s*(?:你好\s*[，,、]?\s*大白|大白\s*[，,、]?\s*你好)'
@@ -2284,9 +2094,6 @@ def run_session(wake_ack=False):
                 text = wake_pattern.sub("", raw_text, count=1).strip()
                 wake_detected = text != raw_text
 
-                # 只对完整的结束表达触发。
-                # 识别结果常把两句话粘在一起且没有标点（"我知道了你去歇着吧"），
-                # 所以同时看"整句相等"和"结尾匹配"两种形式。
                 exit_phrases = {
                     "再见", "拜拜", "退下", "不聊了", "先这样",
                     "结束对话", "我们结束吧", "我先休息了", "先休息吧",
@@ -2308,7 +2115,6 @@ def run_session(wake_ack=False):
                     wait_tts_finish(5.0)
                     break
 
-                # 情绪关怀（语音触发）：说出消极表达时，先安抚再记录
                 _mood_word = _mood_detect_words(text)
                 if _mood_word:
                     print("%s▌情绪关怀（语音触发：%s）%s" % (C_CYAN, _mood_word, C_RESET))
@@ -2336,7 +2142,6 @@ def run_session(wake_ack=False):
                         wait_or_interrupt(20.0)
                     continue
 
-                # ② 健康数据闭环：老人报数值 -> 解析 -> 按卫健委标准分级 -> 建档 -> 提示
                 if health is not None:
                     _vital = health.parse_vitals(text)
                     if _vital:
@@ -2365,7 +2170,6 @@ def run_session(wake_ack=False):
                         _finish_turn("健康数据入库")
                         continue
 
-                # ② 传感器闭环：说「量一下心率」直接驱动 MAX30102
                 if _maybe_voice_measure(text):
                     _finish_turn("传感器测量")
                     continue
@@ -2442,9 +2246,7 @@ def run_session(wake_ack=False):
         audio_mgr.resume_kws()
 
 
-# ==================== 主入口 ====================
 def _peripheral_status():
-    """一行打印外设状态；没装模块/没接硬件都只是降级，不影响语音。"""
     if sensors is None:
         return "未加载（缺 baymax_sensors.py，或 BAYMAX_SENSORS=0）"
     try:
@@ -2455,7 +2257,6 @@ def _peripheral_status():
 
 
 def voice_cache_summary():
-    """打印语音缓存是否真的能找到，这是「有回答但没声音」的第一个排查点。"""
     root = VOICE_CACHE_ROOT
     if not os.path.isdir(root):
         return "❌ 目录不存在: %s" % root
@@ -2470,7 +2271,6 @@ def voice_cache_summary():
 
 
 def check_startup():
-    """启动自检：参考片同款四列 HUD，一屏看完。"""
     print("")
     print("%s大白 · 健康陪护助手 3.3%s" % (C_CYAN, C_RESET))
     print("%s────────────────────────────────────────────────────────────%s" % (C_GRAY, C_RESET))
@@ -2480,7 +2280,6 @@ def check_startup():
 
     _records = load_medical_kb()
     _cache = voice_cache_summary()
-    # 同步探测一遍外设，避免 HUD 先把已接好的设备标成"未探测"
     _periph = ""
     try:
         if sensors is not None and hasattr(sensors, "probe"):
@@ -2537,19 +2336,13 @@ def check_startup():
     print("")
 
 
-# ==================== 情绪关怀闭环 ====================
-# 不猜测面部表情（模糊画面下不可靠），改用三个稳定信号：
-#   1) 长时间没有交互（计时）
-#   2) 语音里出现消极表达（文本）
-#   3) 摄像头确认"画面里有人在"（避免对着空房间说话）
-MOOD_IDLE_SECONDS = _env_float("BAYMAX_MOOD_IDLE_SECONDS", 1200.0)   # 默认 20 分钟
-MOOD_COOLDOWN = _env_float("BAYMAX_MOOD_COOLDOWN", 3600.0)           # 主动关怀间隔
+MOOD_IDLE_SECONDS = _env_float("BAYMAX_MOOD_IDLE_SECONDS", 1200.0)
+MOOD_COOLDOWN = _env_float("BAYMAX_MOOD_COOLDOWN", 3600.0)
 MOOD_CHECK = "您今天话少了很多，是哪儿不舒服吗？还是心里有事？"
 MOOD_ASK = "听着您心情不太好，要不要跟我说说？"
 MOOD_COMFORT = "我记下了。要是心里闷得慌，可以跟家里人说说话。"
 MOOD_BYE = "好的，那我陪着您，有事随时叫我。"
 
-# 消极表达：只在短语里出现才触发，避免"这药没意思"之类误判
 MOOD_WORDS = ("没意思", "不想活", "活着没劲", "心里难受", "心里烦", "心烦",
               "睡不着", "失眠", "一个人", "孤单", "没人管", "难受死了",
               "不想动", "没胃口", "烦得很", "郁闷", "想哭", "没劲")
@@ -2561,7 +2354,6 @@ _MOOD_STATE = os.path.join(os.path.expanduser("~/.baymax"), "mood_last.json")
 
 
 def _mood_load_last_ask():
-    """冷却时间要跨重启保留，否则守护进程一拉起就会再问一次。"""
     global _mood_last_ask
     try:
         with open(_MOOD_STATE, encoding="utf-8") as f:
@@ -2583,7 +2375,6 @@ _mood_load_last_ask()
 
 
 def _mood_touch():
-    """每次有效交互都刷新"最近一次互动时间"。"""
     global _mood_last_interaction
     _mood_last_interaction = time.time()
 
@@ -2599,7 +2390,6 @@ def _mood_detect_words(text):
 
 
 def _mood_camera_faces():
-    """抓一张，返回人脸数；摄像头不可用返回 None。"""
     if sensors is None or not hasattr(sensors, "csi_snapshot"):
         return None
     try:
@@ -2613,7 +2403,6 @@ def _mood_camera_faces():
 
 
 def handle_mood_care(trigger="idle", hint=""):
-    """主动关怀：先确认画面里有人，再开口；听到回答后分流。"""
     global _mood_last_ask
     with _mood_lock:
         if time.time() - _mood_last_ask < MOOD_COOLDOWN:
@@ -2626,7 +2415,6 @@ def handle_mood_care(trigger="idle", hint=""):
           % (C_CYAN, trigger, "不可用" if faces is None else faces, C_RESET))
     require_face = (os.getenv("BAYMAX_MOOD_REQUIRE_FACE", "1") or "1").strip() != "0"
     if require_face and faces == 0:
-        # 画面里没人，可能是空房间，不打扰
         if _service is not None:
             try:
                 _service.note_event("mood", result="skipped_no_face", trigger=trigger)
@@ -2657,7 +2445,6 @@ def handle_mood_care(trigger="idle", hint=""):
             print("%s我: %s%s" % (C_DIM, reply, C_RESET))
 
         _mood_touch()
-        # 回答里提到身体不适 -> 交给健康流程
         if reply and health is not None and health.parse_vitals(reply):
             ui_bot("我先记下这个数值，稍后帮您看看。", tag="关怀")
             enqueue_tts("好的，我知道了。")
@@ -2682,8 +2469,6 @@ def handle_mood_care(trigger="idle", hint=""):
 
 
 def _mood_watchdog(on_idle):
-    """后台巡检：长时间没互动就触发一次关怀。"""
-    # 巡检间隔取"闲置阈值的一半"并限制在 5–20 秒，保证到点能及时触发
     interval = max(5.0, min(20.0, MOOD_IDLE_SECONDS / 2.0))
     while not shutdown_event.is_set():
         if shutdown_event.wait(interval):
@@ -2694,16 +2479,12 @@ def _mood_watchdog(on_idle):
             idle = time.time() - _mood_last_interaction
             if idle >= MOOD_IDLE_SECONDS:
                 on_idle()
-                _mood_touch()          # 触发后重新计时，避免连续打扰
+                _mood_touch()
         except Exception:
             pass
 
 
-# ==================== 跌倒关怀闭环 ====================
-# 顺序很重要：先安抚+询问，再听回答，最后才决定要不要惊动家属。
-# 直接秒通知家属会把"弯腰捡东西"也变成一次骚扰电话。
 FALL_ASK = "检测到异常跌倒，请问您发生了什么事？"
-# 备选：这句在缓存里一定有，万一新话术的音频丢了也不会没声音
 FALL_ASK_BACKUP = "您还好吗？有没有摔伤？需要我通知家里人吗？"
 FALL_CONFIRM = "好的，我这就通知家里人，您先别动。"
 FALL_CANCEL = "好的，那我先不通知，您慢慢起来，当心点。"
@@ -2714,8 +2495,6 @@ fall_event = threading.Event()
 
 
 def _speak_priority(text, fallback=None, tag=""):
-    """播报关键语句：没缓存就退回缓存版本，绝不现场合成（现场合成要 30 秒以上，
-    等它生成完，录音早结束了——现场表现就是"完全没有声音"）。"""
     try:
         ok = bool(resolve_any_voice_cache(text))
     except Exception:
@@ -2732,7 +2511,6 @@ def _speak_priority(text, fallback=None, tag=""):
 
 
 def _on_fall_detected(g):
-    """检测到跌倒：先开口问，判断交给主线程（避免后台线程抢麦克风）。"""
     global _last_fall_g
     _last_fall_g = float(g)
     print(f"\n🚨 [跌倒检测] 检测到跌倒（合加速度 {g:.2f}g）")
@@ -2742,11 +2520,6 @@ def _on_fall_detected(g):
 
 
 def _is_self_echo(reply, spoken=None):
-    """判断识别结果是不是"把自己的播报录回去了"。
-
-    麦克风和音响是两台设备，但声音会经空气回授；不处理的话，
-    大白刚问完就把自己的话当成老人回答，误判成"有回应"。
-    """
     r = (reply or "").strip()
     if not r:
         return False
@@ -2758,12 +2531,10 @@ def _is_self_echo(reply, spoken=None):
         ratio = difflib.SequenceMatcher(None, r, ref).ratio()
     except Exception:
         ratio = 0.0
-    # 相似度高，或者答案里有大段和提问重合，都判为回授
     return ratio >= 0.55 or (len(r) >= 4 and r in ref)
 
 
 def _fall_is_okay(reply):
-    """老人说"我没事/不用"这类，就不惊动家属。"""
     r = (reply or "").strip()
     if not r:
         return False
@@ -2771,7 +2542,6 @@ def _fall_is_okay(reply):
 
 
 def handle_fall_confirm():
-    """跌倒关怀闭环：问 -> 听 -> 判断 -> 通知/取消 -> 写档案。"""
     print("\n🩺 [跌倒关怀] 主动询问已发出，等待回答")
     wait_or_interrupt(20.0)
     if shutdown_event.is_set():
@@ -2825,15 +2595,6 @@ def handle_fall_confirm():
 
 
 def _fall_alert(reason, reply=""):
-    """跌倒告警总闸：走闭环引擎做「评估 → 决策 → 执行 → 记录」。
-
-    设计要点：
-       - 先由 baymax_loop 评估等级，按等级决定动作，而不是一律全发；
-       - 钉钉和短信**同时**发，谁先到算谁；
-       - 短信带"现场有没有人"和定位；
-       - 说完没事的（level=NORMAL）在本地终止，不惊动家属；
-       - 45 秒无回应自动升级到电话（可关）。
-    """
     decision = None
     if baymax_loop is not None:
         decision = baymax_loop.assess_fall(g_force=_last_fall_g, reply=reply)
@@ -2859,7 +2620,6 @@ def _fall_alert(reason, reply=""):
     if _hub is not None:
         try:
             _cam = _hub.get_camera()
-            # 只信真实摄像头；SimCamera 返回的是写死的 1，不能写进告警短信里
             if _cam is not None and type(_cam).__name__ != "SimCamera":
                 faces = _cam.count_faces()
                 _p = os.path.join(os.path.expanduser("~/.baymax"),
@@ -2867,7 +2627,6 @@ def _fall_alert(reason, reply=""):
                 photo = _p if _cam.snapshot(_p) else None
                 print("📷 [现场] 人脸数=%s 照片=%s" % (faces, photo or "未保存"))
             elif sensors is not None and hasattr(sensors, "csi_snapshot"):
-                # CSI 摄像头（OV5647）：厂商 GStreamer 源抓帧 + 人脸检测
                 _p = os.path.join(os.path.expanduser("~/.baymax"),
                                   "fall_%s.jpg" % time.strftime("%Y%m%d_%H%M%S"))
                 if sensors.csi_snapshot(_p):
@@ -2881,7 +2640,6 @@ def _fall_alert(reason, reply=""):
         except Exception:
             pass
 
-    # ---- 摄像头二次确认：用画面判断"升级还是安抚" ----
     visual = None
     if faces is None:
         visual = "no_camera"
@@ -2895,11 +2653,9 @@ def _fall_alert(reason, reply=""):
     if decision is not None and baymax_loop is not None:
         decision.data["visual"] = visual
         if visual == "no_face":
-            # 画面里没人 → 更危险，直接升到危急
             decision.level = baymax_loop.Level.CRITICAL
 
 
-    # 钉钉自定义机器人不支持直接发图，改成"另存一份 + 发链接"
     photo_url = None
     if photo:
         try:
@@ -2916,7 +2672,6 @@ def _fall_alert(reason, reply=""):
             pos = sensors.get_position()
         except Exception:
             pos = None
-    # 位置只给坐标：不写行政区名字，家属可用地图直接定位
     pos_text = ("位置：%s" % pos) if pos else "位置：未获取到（无卫星定位）"
 
     bits = []
@@ -2929,10 +2684,8 @@ def _fall_alert(reason, reply=""):
     if reply:
         bits.append("应答：%s" % reply)
     bits.append(pos_text)
-    # 免责声明随告警一起送达：家属会看到"这是辅助工具，不是医生"
     if photo_url:
         bits.append("照片 %s" % photo_url)
-    # 短信字数宝贵：免责声明只放钉钉，短信直接给行动指令
     bits.append("请尽快拨打电话确认")
     detail = "；".join(bits)
 
@@ -2972,7 +2725,6 @@ def _fall_alert(reason, reply=""):
     sms = results.get("sms")
     print("📣 [告警] 钉钉=%s  短信=%s（%s）" % (status, sms, results.get("sms_msg", "")))
     if status != "sent":
-        # 钉钉失败必须能看到原因：关键词不匹配 / token 失效都会在这里暴露
         print("   ● 钉钉失败原因：%s" % (results.get("ding_err") or "未知"))
     handle_emergency_status(status)
 
@@ -2995,14 +2747,12 @@ def _fall_alert(reason, reply=""):
         except Exception:
             pass
 
-    # 家属电话一定要打：摄像头成功与否都不能影响呼救
     if (os.getenv("BAYMAX_CALL_NOFACE", "1") or "1").strip() != "0" and sensors is not None:
         try:
             _ok, _msg = sensors.place_call()
             called = "ok" if _ok else "failed"
             _tag = "画面无人，立即拨号" if visual == "no_face" else "无应答，立即拨号"
             print("%s📞 [紧急拨号] %s：%s%s" % (C_CYAN, _tag, _msg, C_RESET))
-            # 两通都没接：再补一条钉钉，提醒家属主动回拨
             if "未接" in str(_msg):
                 try:
                     requests.post(DINGTALK_WEBHOOK, timeout=6, json={
@@ -3015,14 +2765,10 @@ def _fall_alert(reason, reply=""):
         except Exception as _e:
             print("📞 [电话] 失败：%s" % _e)
 
-    # 打开"可取消/可升级"的告警窗口：45 秒内用户还能改主意
     if _loop is not None and decision is not None:
         alert = _loop.open(decision, escalate_after=_env_float("BAYMAX_ESCALATE_SECONDS", 45.0))
-        # 电话已经在上面打过（含 90 秒后重拨），这里就不再重复拨打，
-        # 否则家属会接到第三、第四通电话。
         if called is None:
             _schedule_escalation(alert, reason)
-        # 闭环的"执行→安抚"：告警发出后继续陪着老人，而不是说完就走
         try:
             if status == "sent":
                 enqueue_tts("我已经通知您家里人了，您先别动，我在这儿陪着您。")
@@ -3031,7 +2777,6 @@ def _fall_alert(reason, reply=""):
 
 
 def _schedule_escalation(alert, reason):
-    """闭环升级：发了告警但家属没回应时，按策略再打一个电话。"""
     def _worker():
         wait = alert.escalate_after + 5.0
         step = 5.0
@@ -3068,14 +2813,12 @@ def _schedule_escalation(alert, reason):
         pass
 
 
-# ==================== 硬件闭环（跌倒 / 心率血氧 / 4G 短信） ====================
 MEASURE_ACK = "好的，请把手指放到传感器上，我测一下。"
 _MEASURE_WORDS = ("量一下", "测一下", "量个", "测个", "测心率", "量心率", "测血氧",
                   "量血氧", "测心跳", "量心跳", "帮我测", "帮我量", "测一测", "量一量")
 
 
 def _on_health_measured(res):
-    """测完一次心率血氧：说话（用已缓存的短句）+ 记档案 + 刷新面板。"""
     if not isinstance(res, dict):
         return
     hr = int(res.get("hr") or 0)
@@ -3115,11 +2858,6 @@ def _on_health_measured(res):
 
 
 def _probe_extra():
-    """后台探测 4G 和摄像头（可能各要几秒），完成后刷新面板状态。
-
-    放后台的原因：摄像头打开在 K1 上偶尔要 5 秒以上，
-    不能让它把语音启动流程拖住。
-    """
     try:
         _hub.get_modem()
         _hub.get_camera()
@@ -3130,7 +2868,6 @@ def _probe_extra():
 
 
 def start_peripherals():
-    """启动 MPU6050 / MAX30102；没有硬件就退回模拟源（面板会明确标「模拟」）。"""
     global _hub
     if sensors is None or not hasattr(sensors, "get_hub"):
         print("[外设] 硬件模块未加载，跌倒与心率闭环可用面板按钮触发")
@@ -3146,10 +2883,7 @@ def start_peripherals():
             parts.append("%s %s" % (row.get("dev", ""), flag.get(st, "?")))
             if st in ("缺失", "未探测", "模拟"):
                 issues.append(row.get("dev", ""))
-        # 未接入项已由上面的四列 HUD 统一展示，这里不再重复打印，
-        # 否则会出现"HUD 说已就绪、下面又说未接入"的自相矛盾。
         threading.Thread(target=_probe_extra, name="HwProbe", daemon=True).start()
-        # 情绪关怀巡检：长时间没互动就主动开口（内部有冷却，不会反复打扰）
         threading.Thread(target=_mood_watchdog, name="MoodCare", daemon=True,
                          args=(lambda: handle_mood_care("idle"),)).start()
     except Exception as e:
@@ -3157,13 +2891,11 @@ def start_peripherals():
 
 
 def _maybe_voice_measure(text):
-    """说「量一下心率」就让 MAX30102 测一次。返回 True 表示这一轮已被测量占用。"""
     t = (text or "").strip()
     if not t or sensors is None or _hub is None:
         return False
     if not any(w in t for w in _MEASURE_WORDS):
         return False
-    # 「血压」是老人自己报数，不用传感器
     if "血压" in t and "心率" not in t and "血氧" not in t:
         return False
     if not sensors.measure_health():
@@ -3194,8 +2926,6 @@ def main():
 
         wake_thread.start()
         wake_started = True
-        # KWS 首次初始化要加载三个 ONNX 模型，板端冷启动可能需要 20–30 秒。
-        # 这里只做提示，不当作失败：模型加载完 kws_ready 会自己置位。
         if not kws_ready.wait(timeout=30):
             print("%s  KWS 仍在加载模型，稍后可用%s" % (C_GRAY, C_RESET))
         elif kws_error:
@@ -3218,7 +2948,6 @@ def main():
                 _service = None
                 print(f"[服务] 启动失败：{type(e).__name__}: {e}")
 
-        # 欢迎语直接播你录好的原声，不依赖 TTS 模型是否加载成功。
         ui_bot("你好，我叫大白，我是你的私人健康顾问。", tag="开机")
         if os.path.exists(CLONE_REF_PATH):
             threading.Thread(target=lambda: subprocess.run(
@@ -3272,7 +3001,6 @@ def main():
                     if not shutdown_event.is_set():
                         tty.setcbreak(fd)
             elif ch in ("f", "F"):
-                # 现场网络不通、面板打不开时，终端里也能演示跌倒闭环
                 print("\n⌨️  [键盘] 触发模拟跌倒")
                 _injected = False
                 if sensors is not None and _hub is not None:
@@ -3310,7 +3038,6 @@ def main():
             proc = _kws_proc
         terminate_process(proc, timeout=0.5)
 
-        # 尽可能唤醒工作线程；队列满时先取消队列内容再放入哨兵。
         try:
             tts_queue.put_nowait(None)
         except queue.Full:
@@ -3349,8 +3076,6 @@ def main():
         if alive:
             print(f"⚠️ 以下线程在等待期限后仍未退出：{', '.join(alive)}")
             print("⚠️ 可能仍有不可中断的模型推理；请检查进程状态。")
-            # ZipVoice 的 C++ 推理一旦开始就不可中断，Python 正常退出时会跟它抢析构，
-            # 表现为 "segmentation fault (core dumped)"。这里直接硬退出，避免吓人的报错。
             try:
                 sys.stdout.flush()
                 sys.stderr.flush()
@@ -3364,7 +3089,6 @@ def main():
 
 
 def run_kb_self_tests():
-    """轻量回归自测：验证检索相关性与急症规则，不连接麦克风或 LLM。"""
     cases = [
         ("高血压要注意什么", lambda q, h: any(x["item"]["id"] == "hypertension" for x in h)),
         ("我摔倒爬不起来怎么办", lambda q, h: any(x["item"]["id"] == "fall" for x in h) and contains_high_risk_symptom(q)),

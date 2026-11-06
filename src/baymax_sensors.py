@@ -1,55 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""大白 3.3 硬件感知层：MPU6050 跌倒 / MAX30102 心率血氧 / EC20 短信 / USB 摄像头。
-
-=====================================================================
-设计三条铁律（这是能"实际跑通"的前提）
-=====================================================================
-1. **一个外设挂了，语音链路必须照常工作。**
-   每个驱动构造失败只打印一行原因，主程序继续跑，绝不抛到主循环。
-
-2. **总线自己找，不写死。**
-   K1 上 i2c-0/1/2/5/8 都存在，用户插哪个口都有可能。启动时扫一遍，
-   MPU6050 认 0x68/0x69，MAX30102 认 0x57，谁在就用谁。
-
-3. **没有硬件时，用同一套算法跑模拟数据。**
-   模拟源只替换"数据从哪里来"，数据处理链（跌倒状态机 / 脉搏波心率血氧
-   算法 / 短信 AT 序列）全部是真实代码。所以：
-     - 现在没接传感器 → 四条闭环照样能演示（界面上明确标「模拟」）；
-     - 传感器到了插上 → 换数据源而已，算法已经被验证过。
-
-=====================================================================
-硬件接线（比赛现场照这个插）
-=====================================================================
-  MPU6050  VCC->3.3V(1脚)  GND->GND(6脚)  SDA->SDA(3脚)  SCL->SCL(5脚)
-           AD0 悬空=>0x68，接 VCC=>0x69（两个地址都会自动试）
-  MAX30102 VCC->3.3V  GND->GND  SDA->SDA  SCL->SCL   地址固定 0x57
-           注意：MAX30102 模块大多是 1.8V 逻辑，模块板上一般自带 LDO，
-           直接接 3.3V 供电即可；不要接到 5V。
-  EC20     插 USB，会出现 /dev/ttyUSB0..3，AT 口通常是 ttyUSB2
-           需要设置 EC20_SMS_PORT=/dev/ttyUSB2  ALERT_PHONE=138xxxxxxxx
-  USB摄像头 免驱 UVC，插上出现 /dev/video0
-
-=====================================================================
-环境变量
-=====================================================================
-  BAYMAX_HW_SIM        auto(默认) | 0(只用真硬件) | 1(强制模拟)
-  BAYMAX_MPU_BUS       指定 MPU6050 的 i2c 总线号（不填=自动扫描）
-  BAYMAX_MAX30102_BUS  指定 MAX30102 的总线号（不填=自动扫描）
-  BAYMAX_I2C_SKIP      跳过的总线号，逗号分隔，默认 "9"（i2c-9 探测会卡住）
-  EC20_SMS_PORT        EC20 的 AT 串口
-  BAYMAX_EC20_PORT     同 EC20_SMS_PORT（新名字）
-  ALERT_PHONE          告警短信接收号码
-  BAYMAX_CAM_INDEX     摄像头序号，默认 0
-  BAYMAX_FALL_*        跌倒阈值，见下面常量
-
-=====================================================================
-自测
-=====================================================================
-  python3 baymax_sensors.py --test      打印所有外设状态
-  python3 baymax_sensors.py --ppg       跑一遍心率血氧算法（合成脉搏波）
-  python3 baymax_sensors.py --sms 文本   发一条测试短信
-"""
 import glob
 import json
 import math
@@ -64,9 +14,9 @@ import time
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.getenv("BAYMAX_CONFIG", os.path.join(BASE_DIR, "config.json"))
 
-try:  # numpy 板上一定有；没有也能跑，只是心率血氧算法自动关闭
+try:
     import numpy as np
-except Exception:  # pragma: no cover
+except Exception:
     np = None
 
 
@@ -90,32 +40,25 @@ _CFG = _load_config()
 _SEN_CFG = (_CFG.get("sensors") or {})
 _THR = _CFG.get("thresholds") or {}
 
-# ---------------- 全局开关 ----------------
 SIM_MODE = str(os.getenv("BAYMAX_HW_SIM", "auto")).strip().lower()
 
-# ---------------- MPU6050 ----------------
 _MPU_CFG = (_SEN_CFG.get("mpu6050") or {})
 MPU_BUS = int(os.getenv("BAYMAX_MPU_BUS", "") or _MPU_CFG.get("bus") or 0)
 MPU_ADDRS = (0x68, 0x69)
-# 跌倒三段式阈值（±4g 量程下实测手感最好的一组：静止 1.0g / 自由落体 <0.5g / 撞击 >2.2g）
 FALL_FREEFALL_G = _float_env("BAYMAX_FALL_FREEFALL_G", _THR.get("fall_freefall_g", 0.50))
 FALL_IMPACT_G = _float_env("BAYMAX_FALL_IMPACT_G", _THR.get("fall_impact_g", 2.20))
 FALL_STILL_SEC = _float_env("BAYMAX_FALL_STILL_SEC", _THR.get("fall_still_sec", 1.2))
 FALL_STILL_TOL = _float_env("BAYMAX_FALL_STILL_TOL", _THR.get("fall_still_tol", 0.30))
 FALL_COOLDOWN = _float_env("BAYMAX_FALL_COOLDOWN", _THR.get("fall_cooldown", 60.0))
 
-# ---------------- MAX30102 ----------------
 MAX30102_ADDR = 0x57
-MAX30102_FS = 100.0            # 100 Hz 采样
+MAX30102_FS = 100.0
 
-# ---------------- EC20 ----------------
 EC20_SMS_PORT = (os.getenv("BAYMAX_EC20_PORT") or os.getenv("EC20_SMS_PORT") or "").strip()
 ALERT_PHONE = (os.getenv("ALERT_PHONE") or "").strip()
 
-# ---------------- 摄像头 ----------------
 CAMERA_INDEX = int(os.getenv("BAYMAX_CAM_INDEX", "0") or 0)
 
-# i2c-9 在 MUSE Pi Pro 上 probe 会挂住，默认跳过
 _SKIP_BUS = set()
 for _x in str(os.getenv("BAYMAX_I2C_SKIP", "9")).split(","):
     _x = _x.strip()
@@ -124,11 +67,7 @@ for _x in str(os.getenv("BAYMAX_I2C_SKIP", "9")).split(","):
 _BUS_ORDER = [1, 0, 2, 3, 4, 5, 6, 7, 8]
 
 
-# =====================================================================
-#                       一、I2C 总线自动发现
-# =====================================================================
 def _import_smbus():
-    """返回可用的 smbus 模块；两个都没装返回 None。"""
     try:
         import smbus2 as m
         return m
@@ -155,13 +94,12 @@ def _bus_candidates(preferred=0):
 
 
 def _probe_addr(bus_no, addr):
-    """在某条总线上试一次读；能读到就返回 SMBus 对象，否则 None。"""
     if SMBUS is None:
         return None
     bus = None
     try:
         bus = SMBUS.SMBus(bus_no)
-        bus.read_byte(addr)          # ENXIO/EREMOTEIO 会在这里抛
+        bus.read_byte(addr)
         return bus
     except Exception:
         if bus is not None:
@@ -173,11 +111,6 @@ def _probe_addr(bus_no, addr):
 
 
 def find_i2c(addr, preferred=0, scan_timeout=6.0):
-    """在所有候选总线上找 addr。返回 (bus_no, SMBus) 或 (None, None)。
-
-    用子线程 + 超时包一层：某些总线上探测会卡在内核里（i2c-9 就是），
-    宁可放弃这次探测，也不能让开机流程挂死。
-    """
     if SMBUS is None:
         return None, None
     result = {}
@@ -196,9 +129,6 @@ def find_i2c(addr, preferred=0, scan_timeout=6.0):
     return result.get("hit", (None, None))
 
 
-# =====================================================================
-#                         二、MPU6050 六轴
-# =====================================================================
 MPU_REG_SMPLRT_DIV = 0x19
 MPU_REG_CONFIG = 0x1A
 MPU_REG_ACCEL_CONFIG = 0x1C
@@ -206,17 +136,13 @@ MPU_REG_ACCEL_XOUT_H = 0x3B
 MPU_REG_PWR_MGMT_1 = 0x6B
 MPU_REG_WHO_AM_I = 0x75
 
-# MPU6050=0x68 MPU6500=0x70 MPU9250=0x71 MPU9255=0x73 国产兼容片常见 0x98
 _MPU_WHOAMI_OK = {0x68, 0x69, 0x70, 0x71, 0x72, 0x73, 0x74, 0x75, 0x98}
-_ACCEL_LSB_PER_G = 8192.0        # ±4g
+_ACCEL_LSB_PER_G = 8192.0
 
 
 class Mpu6050:
-    """MPU6050 / MPU6500 / MPU9250 兼容驱动（只用到加速度计那 6 个寄存器）。"""
 
     def __init__(self, bus=None, addr=None, preferred_bus=MPU_BUS):
-        # 先走内核 I2C（smbus2）；MUSE Pi Pro 的 40 针排 I2C 在固件里没启用，
-        # 拿不到总线时自动退回软件 I2C（bit-bang GPIO40/41），不用改内核。
         self.bus_no, self.bus = None, None
         candidates = [addr] if addr else list(MPU_ADDRS)
         kernel_err = None
@@ -234,7 +160,6 @@ class Mpu6050:
         self.gain = 1.0
 
     def _open_kernel(self, bus, candidates, preferred_bus):
-        """内核 I2C 通道（i2c-dev + smbus2）。"""
         if bus is not None:
             self.bus = SMBUS.SMBus(bus)
             self.bus_no = bus
@@ -274,7 +199,6 @@ class Mpu6050:
         raise OSError("内核 I2C 没找到 MPU6050（已扫 i2c-%s）" % "/".join(str(b) for b in buses))
 
     def _open_soft(self, candidates, kernel_err):
-        """软件 I2C 兜底：直接 bit-bang 排针上的 GPIO40/41。"""
         try:
             import soft_i2c
         except Exception as e:
@@ -302,12 +226,12 @@ class Mpu6050:
 
     def _init_chip(self):
         b, a = self.bus, self.addr
-        b.write_byte_data(a, MPU_REG_PWR_MGMT_1, 0x80)   # 复位
+        b.write_byte_data(a, MPU_REG_PWR_MGMT_1, 0x80)
         time.sleep(0.12)
-        b.write_byte_data(a, MPU_REG_PWR_MGMT_1, 0x01)   # 唤醒，时钟源 PLL X 轴陀螺
-        b.write_byte_data(a, MPU_REG_SMPLRT_DIV, 0x04)   # 1k/(1+4) = 200Hz
-        b.write_byte_data(a, MPU_REG_CONFIG, 0x03)       # DLPF 44Hz，滤掉走动抖动
-        b.write_byte_data(a, MPU_REG_ACCEL_CONFIG, 0x08)  # ±4g
+        b.write_byte_data(a, MPU_REG_PWR_MGMT_1, 0x01)
+        b.write_byte_data(a, MPU_REG_SMPLRT_DIV, 0x04)
+        b.write_byte_data(a, MPU_REG_CONFIG, 0x03)
+        b.write_byte_data(a, MPU_REG_ACCEL_CONFIG, 0x08)
         time.sleep(0.05)
 
     @staticmethod
@@ -334,12 +258,6 @@ class Mpu6050:
         return self._s16(raw[0], raw[1]) / 340.0 + 36.53
 
     def calibrate(self, samples=40, period=0.02):
-        """静止标定：算零偏，并把合加速度校到 1.00g。
-
-        老人手环戴着不动时有几度的倾斜，az 就不会是 1.000，
-        所以这里只用"合加速度"做增益校正，不做逐轴归零（逐轴归零会把
-        重力也一起减掉，反而判不准姿态）。
-        """
         accs = []
         for _ in range(max(10, int(samples))):
             try:
@@ -357,7 +275,6 @@ class Mpu6050:
         return True
 
     def posture(self, ax=None, ay=None, az=None):
-        """返回 0~1 的"躺平度"：站着/戴着时 ~0，躺下时 ~1。"""
         if ax is None:
             ax, ay, az = self.read_g()
         mag = math.sqrt(ax * ax + ay * ay + az * az)
@@ -377,19 +294,6 @@ class Mpu6050:
 
 
 class FallStateMachine:
-    """跌倒判定状态机：自由落体 → 撞击 → 静止够久 → 确认跌倒。
-
-    纯逻辑、不读硬件，可以离线跑单元测试：
-        m = FallStateMachine(still_sec=1.5, cooldown=0)
-        m.update(0.0, 1.0)      # 正常站着
-        m.update(0.1, 0.3)      # 失重
-        m.update(0.5, 3.0)      # 撞击
-        m.update(1.0, 1.0)      # 不动了
-        m.update(2.6, 1.0)      # -> True
-
-    只用"自由落体"会漏掉慢慢滑倒；只用"撞击"会被坐下/放东西误触发。
-    三段式 + 静止时长，是成本最低又比较稳的组合。
-    """
 
     def __init__(self, freefall_g=FALL_FREEFALL_G, impact_g=FALL_IMPACT_G,
                  still_sec=FALL_STILL_SEC, still_tol=FALL_STILL_TOL,
@@ -410,11 +314,6 @@ class FallStateMachine:
         self.last_fall = -1e9
 
     def update(self, now, g, horizontal=None):
-        """喂一个采样；判定为跌倒返回 True。
-
-        horizontal: 0~1 的躺平度，可省略。给定时作为附加信息记录，
-                    不强制要求（老人可能是半躺、扶着东西）。
-        """
         if now - self.last_fall < self.cooldown:
             return False
         quiet = abs(g - 1.0) <= self.still_tol
@@ -441,7 +340,6 @@ class FallStateMachine:
                         self.last_fall = now
                         return True
                 else:
-                    # 撞击后还在动（翻身、站起来）→ 认为没摔
                     self.t_still = None
                     if (now - self.t_state) > self.merge_window:
                         self.state = "idle"
@@ -453,7 +351,6 @@ class FallStateMachine:
         return False
 
 
-# 模拟用：一次标准跌倒的加速度脚本（失重 0.15s → 撞击 0.1s → 躺平）
 _FALL_SCRIPT = [
     (0.00, 1.00), (0.10, 0.85), (0.18, 0.42), (0.24, 0.30), (0.30, 0.55),
     (0.36, 2.90), (0.42, 3.40), (0.48, 1.80), (0.55, 1.10), (0.62, 0.98),
@@ -462,11 +359,6 @@ _FALL_SCRIPT = [
 
 
 class SimMpu6050:
-    """模拟 MPU6050：只伪造"加速度从哪来"，状态机是真实代码。
-
-    inject_fall() 之后按 _FALL_SCRIPT 回放一次跌倒波形，
-    这样 FallStateMachine 会像对待真传感器一样把它判出来。
-    """
 
     def __init__(self, bus=0, addr=0x68):
         self.bus_no, self.addr = bus, addr
@@ -492,7 +384,6 @@ class SimMpu6050:
                 self._inject_at = None
             else:
                 g = self._script_g(el)
-                # 把合加速度摊到 az 上，姿态随之变成"躺平"
                 mag = math.sqrt(1.0 + g * g)
                 az = g * az / max(1e-6, mag) if mag else g
                 az = g * 0.98
@@ -534,7 +425,6 @@ class SimMpu6050:
 
 
 class FallMonitor:
-    """后台线程轮询加速度计；判定跌倒时回调 on_fall(g)。"""
 
     def __init__(self, on_fall=None, hz=20.0, sensor=None, allow_sim=None):
         self.on_fall = on_fall
@@ -556,13 +446,13 @@ class FallMonitor:
             return self._sensor
         try:
             s = Mpu6050()
-            pass  # 启动信息统一由主程序 HUD 展示
+            pass
             return s
         except Exception as e:
             reason = "%s: %s" % (type(e).__name__, e)
             if _sim_allowed(self.allow_sim):
                 self.simulated = True
-                pass  # 同上，未接入由 HUD 汇总
+                pass
                 return SimMpu6050()
             raise OSError(reason)
 
@@ -608,7 +498,6 @@ class FallMonitor:
                 pass
             if self.machine.update(now, g, horiz) and self.on_fall:
                 try:
-                    # 报"撞击峰值"而不是此刻的静止值，不然日志里永远是 1.00g
                     self.on_fall(max(self.machine.peak, g))
                 except Exception as e:
                     print("\n⚠️ [跌倒] 回调异常：%s" % e)
@@ -619,11 +508,6 @@ class FallMonitor:
                 next_at = time.monotonic()
 
     def inject_fall(self):
-        """演示/自测入口：让传感器回放一次跌倒。返回是否成功。
-
-        手动触发时顺手清掉状态机和冷却：现场连按两次「模拟跌倒」也要每次都响应，
-        不然演示时会被 60 秒冷却坑到。真实传感器不受影响。
-        """
         fn = getattr(self._sensor, "inject_fall", None)
         if fn is None:
             return False
@@ -639,9 +523,6 @@ class FallMonitor:
         self._stop.set()
 
 
-# =====================================================================
-#                        三、MAX30102 心率血氧
-# =====================================================================
 MAX30102_REG_INTR_STATUS_1 = 0x00
 MAX30102_REG_INTR_STATUS_2 = 0x01
 MAX30102_REG_INTR_ENABLE_1 = 0x02
@@ -660,7 +541,6 @@ MAX30102_REG_RESET = 0xFE
 
 
 class Max30102:
-    """MAX30102 血氧心率传感器。只用 SpO2 模式（RED + IR 双通道）。"""
 
     def __init__(self, bus=None, preferred_bus=int(os.getenv("BAYMAX_MAX30102_BUS", "0") or 0),
                  led_pa=0x24):
@@ -694,24 +574,18 @@ class Max30102:
                     break
             except Exception:
                 pass
-        # 清中断标志
         b.read_byte_data(a, MAX30102_REG_INTR_STATUS_1)
         b.read_byte_data(a, MAX30102_REG_INTR_STATUS_2)
-        # SMP_AVE=4, ROLLOVER_EN=1, FIFO_A_FULL=0x0F
         b.write_byte_data(a, MAX30102_REG_FIFO_CONFIG, 0x4F)
-        # SpO2 模式：RED + IR
         b.write_byte_data(a, MAX30102_REG_MODE_CONFIG, 0x03)
-        # ADC 4096nA / 100Hz / 411us
         b.write_byte_data(a, MAX30102_REG_SPO2_CONFIG, 0x27)
         b.write_byte_data(a, MAX30102_REG_LED1_PA, self.led_pa)
         b.write_byte_data(a, MAX30102_REG_LED2_PA, self.led_pa)
-        # 清空 FIFO 指针
         b.write_byte_data(a, MAX30102_REG_FIFO_WR_PTR, 0x00)
         b.write_byte_data(a, MAX30102_REG_OVF_COUNTER, 0x00)
         b.write_byte_data(a, MAX30102_REG_FIFO_RD_PTR, 0x00)
 
     def read_fifo(self):
-        """读一批 FIFO 样本，返回 [(red, ir), ...]（18 位）。"""
         b, a = self.bus, MAX30102_ADDR
         wr = b.read_byte_data(a, MAX30102_REG_FIFO_WR_PTR) & 0x1F
         rd = b.read_byte_data(a, MAX30102_REG_FIFO_RD_PTR) & 0x1F
@@ -728,7 +602,6 @@ class Max30102:
         return out
 
     def read_window(self, seconds=8.0, fs=MAX30102_FS):
-        """连续采样 seconds 秒，返回 (red[], ir[])。"""
         n_target = int(seconds * fs)
         red, ir = [], []
         deadline = time.monotonic() + seconds * 1.6 + 2.0
@@ -756,9 +629,7 @@ class Max30102:
         return "总线%d 地址0x%02X PART_ID=0x%02X" % (self.bus_no, MAX30102_ADDR, self.part_id)
 
 
-# ---------------- 脉搏波 -> 心率 / 血氧（纯算法，可离线验证） ----------------
 def _movavg(x, win):
-    """滑动平均（边缘补齐），等价于低通，用来去基线漂移。"""
     n = len(x)
     win = int(max(1, win))
     if win <= 1 or n == 0:
@@ -770,14 +641,6 @@ def _movavg(x, win):
 
 
 def _autocorr_period(y, fs, min_bpm=32.0, max_bpm=200.0):
-    """自相关法找心动周期（比数峰稳：二次谐波不会把心率翻倍）。
-
-    注意要**取最小**的那个相关峰：周期信号的 kT 处相关值都接近 1，
-    直接取最大值容易落到 2T 上，心率就变成一半。
-    所以先找最大值，再回头取第一个达到最大值 97% 的局部峰。
-
-    返回 (周期样本数, 归一化相关峰值 0~1)；找不到返回 (0, 0)。
-    """
     n = len(y)
     s = np.array(y, dtype=float)
     s = s - s.mean()
@@ -809,7 +672,6 @@ def _autocorr_period(y, fs, min_bpm=32.0, max_bpm=200.0):
                 and corr.get(lag + 1, -2) <= corr[lag]:
             best_lag = lag
             break
-    # 抛物线插值，把周期精确到小数
     y0 = corr.get(best_lag - 1, 0.0)
     y1 = corr.get(best_lag, 0.0)
     y2 = corr.get(best_lag + 1, 0.0)
@@ -822,22 +684,6 @@ def _autocorr_period(y, fs, min_bpm=32.0, max_bpm=200.0):
 
 
 def analyze_ppg(red, ir, fs=MAX30102_FS, min_ir_dc=8000.0):
-    """从一段 RED/IR 原始信号算心率和血氧。
-
-    返回 dict：
-        finger  手指是否在位
-        hr      心率 bpm（int，0 表示算不出来）
-        spo2    血氧 %（int）
-        quality 0~1，用于判断这次数据能不能用
-
-    算法：
-        1) 去基线漂移：减去 1.5 秒滑动平均，再去掉 80ms 以上的高频噪声
-        2) 心率：对红外通道做自相关，取 32~200bpm 区间内相关最大的滞后
-           （不用数峰：脉搏波的二次谐波很容易把数峰法算成两倍心率）
-        3) 血氧：R = (AC_red/DC_red) / (AC_ir/DC_ir)，SpO2 = 110 - 25R
-           AC 用标准差（RMS），比峰峰值抗噪。这条经验式来自 MAXIM 应用笔记，
-           绝对精度约 ±2%，用于"偏高/偏低"的趋势提示足够。
-    """
     if np is None or red is None or ir is None or len(red) == 0 or len(ir) == 0:
         return {"finger": False, "hr": 0, "spo2": 0, "quality": 0.0,
                 "dc_ir": 0.0, "ac_ir": 0.0, "reason": "no-numpy-or-data"}
@@ -856,8 +702,6 @@ def analyze_ppg(red, ir, fs=MAX30102_FS, min_ir_dc=8000.0):
                 "dc_ir": dc_ir, "ac_ir": 0.0, "reason": "no-finger"}
 
     win = int(fs * 2.0)
-    # 减去 2 秒滑动平均 = 高通，去掉基线漂移（呼吸、手抖、环境光）
-    # 再做个 5 点滑动平均 = 低通，压掉高频噪声
     ir_ac = _movavg(i - _movavg(i, win), 5)
     red_ac = _movavg(r - _movavg(r, win), 5)
     ac_ir = float(np.std(ir_ac))
@@ -874,7 +718,6 @@ def analyze_ppg(red, ir, fs=MAX30102_FS, min_ir_dc=8000.0):
     ratio = (ac_red / dc_red) / (ac_ir / dc_ir)
     spo2 = int(round(max(70.0, min(100.0, 110.0 - 25.0 * ratio))))
 
-    # 灌注指数：交流/直流 的比例，太低说明手指没压好或信号太弱
     pi = ac_ir / dc_ir
     quality = max(0.0, min(1.0, corr * min(1.0, pi / 0.004)))
     if hr == 0:
@@ -888,11 +731,6 @@ def analyze_ppg(red, ir, fs=MAX30102_FS, min_ir_dc=8000.0):
 
 def synth_ppg(hr=72.0, spo2=98.0, seconds=8.0, fs=MAX30102_FS,
               dc_ir=60000.0, ac_ir_ratio=0.020, seed=1, noise=0.0004):
-    """合成一段脉搏波，用于离线验证 analyze_ppg（也让模拟模式有真波形）。
-
-    返回 (red, ir)。spo2 决定红光/红外交流分量之比：
-        R = (110 - SpO2) / 25
-    """
     if np is None:
         return [], []
     rng = np.random.RandomState(seed)
@@ -908,7 +746,6 @@ def synth_ppg(hr=72.0, spo2=98.0, seconds=8.0, fs=MAX30102_FS,
 
 
 class SimMax30102:
-    """模拟 MAX30102：输出合成脉搏波，analyze_ppg 是同一份真实算法。"""
 
     def __init__(self, hr=72.0, spo2=98.0, bus=0):
         self.hr, self.spo2 = float(hr), float(spo2)
@@ -928,7 +765,6 @@ class SimMax30102:
         return "模拟(未检测到硬件)"
 
 
-# 心率血氧 -> 固定语音（必须和 short_texts.json 里的文案逐字一致）
 HEALTH_PHRASES = {
     "hr_ok": "心率正常，血氧也正常，这次数据记到档案里了。",
     "hr_fast": "心跳有点快，先坐下休息两分钟，再测一次。",
@@ -940,7 +776,6 @@ HEALTH_PHRASES = {
 
 
 def phrase_for(hr, spo2, finger=True):
-    """把一次测量结果映射到一句已缓存的话，避免现场合成。"""
     if not finger:
         return "no_finger", HEALTH_PHRASES["no_finger"]
     if spo2 and spo2 < 90:
@@ -955,11 +790,6 @@ def phrase_for(hr, spo2, finger=True):
 
 
 class HealthMonitor:
-    """按需测一次心率血氧（8 秒），结果通过回调交回主程序。
-
-    不自动连续测：MAX30102 需要手指压住，连续测既费电又刷屏，
-    而且老人不会一直按着。面板按钮 / 语音"量一下"触发一次即可。
-    """
 
     def __init__(self, on_result=None, sensor=None, seconds=8.0, allow_sim=None):
         self.on_result = on_result
@@ -981,13 +811,13 @@ class HealthMonitor:
             return self._sensor
         try:
             s = Max30102()
-            pass  # 同上
+            pass
             return s
         except Exception as e:
             reason = "%s: %s" % (type(e).__name__, e)
             if _sim_allowed(self.allow_sim):
                 self.simulated = True
-                pass  # 同上
+                pass
                 return SimMax30102()
             raise OSError(reason)
 
@@ -1005,7 +835,6 @@ class HealthMonitor:
         return True
 
     def request(self):
-        """请求测一次；正在测就忽略这次。"""
         if not self.available:
             return False
         self._req.set()
@@ -1044,11 +873,7 @@ class HealthMonitor:
         self._req.set()
 
 
-# =====================================================================
-#                         四、EC20 4G 短信
-# =====================================================================
 def net_online(host="223.5.5.5", port=53, timeout=2.0):
-    """一次 TCP 连接判断是否真联网（不依赖 HTTP 代理）。"""
     try:
         with socket.create_connection((host, port), timeout=timeout):
             return True
@@ -1057,12 +882,6 @@ def net_online(host="223.5.5.5", port=53, timeout=2.0):
 
 
 class MmcliModem:
-    """4G 短信（ModemManager / mmcli 通道）。
-
-    为什么不用 AT：EC25 被 ModemManager 接管后 /dev/ttyUSB2 是排他的，
-    直接开串口会 "Device or resource busy"。mmcli 走 D-Bus，两边不打架。
-    需要 /etc/polkit-1/rules.d/50-baymax-mm.rules 给 baymax 用户授权。
-    """
 
     def __init__(self, phone=None, index=None):
         self.index = self._pick_index() if index is None else index
@@ -1074,7 +893,6 @@ class MmcliModem:
 
     @staticmethod
     def _pick_index():
-        """模块拔插后索引会变（Modem/0 → Modem/1），不能写死。"""
         try:
             r = subprocess.run(["mmcli", "-L"], capture_output=True, text=True, timeout=8)
             out = (r.stdout or "") + (r.stderr or "")
@@ -1151,14 +969,7 @@ class MmcliModem:
         pass
 
     def get_position(self):
-        """定位：优先 GPS（室外才有），没信号就用网络 IP 粗定位（城市级）。
-
-        返回给短信用的字符串，例如：
-            "30.1234,104.5678（卫星定位）"
-            "四川省成都市 30.6667,104.0667（网络定位）"
-        """
         import re
-        # 1) 卫星定位
         try:
             r = self._run("--location-get", timeout=6)
             out = (r.stdout or "") + (r.stderr or "")
@@ -1170,7 +981,6 @@ class MmcliModem:
                     return "%.4f,%.4f（卫星定位）" % (la, lo)
         except Exception:
             pass
-        # 2) 预设安装位置（固定式陪护设备，位置基本不变，比 IP 定位准得多）
         try:
             loc = (_CFG.get("location") or {}) if isinstance(_CFG, dict) else {}
             if loc.get("lat") and loc.get("lon"):
@@ -1179,7 +989,6 @@ class MmcliModem:
                     float(loc["lat"]), float(loc["lon"]))
         except Exception:
             pass
-        # 3) 网络 IP 粗定位（最后兜底，城市级）
         try:
             import json as _json
             import urllib.request
@@ -1196,22 +1005,14 @@ class MmcliModem:
         return None
 
     def place_call(self, number=None, timeout=220):
-        """用 4G 拨打电话。
-
-        EC20 的 QMI 语音通道在 ModemManager 下不工作（能建通话对象但拨不出去），
-        必须停掉 MM 用 ATD 直拨。done by /usr/local/bin/baymax_call.sh，
-        baymax 用户通过 sudoers 免密调用，只允许这一个脚本。
-        """
         number = (number or self.phone or "").strip()
         if not number:
             return False, "没配置告警号码 ALERT_PHONE"
         helper = "/usr/local/bin/baymax_call.sh"
         if os.path.isfile(helper):
-            # 第一通没接就再拨一次：家属手机可能不在身边
             last_out = ""
             for attempt in (1, 2):
                 try:
-                    # 振铃给足 50 秒，对方有充分时间接听
                     r = subprocess.run(["sudo", "-n", helper, number, "20"],
                                        capture_output=True, text=True, timeout=timeout)
                 except Exception as e:
@@ -1231,7 +1032,6 @@ class MmcliModem:
             tail = last_out.strip().splitlines()[-1][:70] if last_out.strip() else "无输出"
             return False, "拨号失败：" + tail
 
-        # 没有 helper 时退回 ModemManager（多数情况拨不出去，仅作兜底）
         try:
             r = self._run("--voice-create-call=number=%s" % number, timeout=15)
         except Exception as e:
@@ -1248,11 +1048,6 @@ class MmcliModem:
 
 
 class Ec20:
-    """EC20 的 AT 指令通道（termios 裸串口，不依赖 pyserial）。
-
-    中文短信必须走 UCS2；很多模块默认 GSM 字符集，直接发中文会变成问号。
-    主流程失败会退回 ASCII 文本再发一次。
-    """
 
     def __init__(self, port=None, phone=None, baud=115200):
         self.port = (port or EC20_SMS_PORT or "").strip()
@@ -1263,17 +1058,16 @@ class Ec20:
         self.signal = None
         self.operator = ""
 
-    # ---------- 串口底层 ----------
     def _open(self, port):
         import termios
         fd = os.open(port, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
         try:
             attrs = termios.tcgetattr(fd)
             speed = getattr(termios, "B%d" % self.baud, termios.B115200)
-            attrs[0] = 0                                  # iflag
-            attrs[1] = 0                                  # oflag
-            attrs[2] = termios.CLOCAL | termios.CREAD    # cflag: 8N1
-            attrs[3] = 0                                  # lflag: raw
+            attrs[0] = 0
+            attrs[1] = 0
+            attrs[2] = termios.CLOCAL | termios.CREAD
+            attrs[3] = 0
             attrs[4] = attrs[5] = speed
             attrs[6][termios.VMIN] = 0
             attrs[6][termios.VTIME] = 0
@@ -1351,7 +1145,6 @@ class Ec20:
         return buf.decode("utf-8", "ignore")
 
     def cmd(self, line, timeout=1.5, expect=("OK",)):
-        """发一条 AT，返回 (是否匹配期望, 原始回显)。"""
         if self.fd is None:
             return False, ""
         try:
@@ -1364,9 +1157,7 @@ class Ec20:
             return False, resp
         return (any(e in resp for e in expect) if expect else True), resp
 
-    # ---------- 业务 ----------
     def status(self):
-        """查一次 SIM 卡和信号，返回 dict。"""
         info = {"port": self.port, "ready": False, "csq": None, "operator": ""}
         if not self.open():
             info["error"] = self.error
@@ -1391,7 +1182,6 @@ class Ec20:
         return "".join("%04X" % ord(c) for c in text if ord(c) <= 0xFFFF)
 
     def _sms_body(self, text, ucs2=True):
-        """返回 (命令串, 是否需要 UCS2)。"""
         if ucs2 and any(ord(c) > 127 for c in text):
             self.cmd('AT+CSCS="UCS2"', timeout=1.2)
             return self._ucs2(text), True
@@ -1432,7 +1222,6 @@ class Ec20:
 
 
 class SimEc20:
-    """模拟 EC20：不发真短信，把内容写进 ~/.baymax/sms_outbox.log，返回成功。"""
 
     def __init__(self, port="sim", phone=None):
         self.port = "sim"
@@ -1465,9 +1254,7 @@ class SimEc20:
         return "模拟(未检测到硬件)"
 
 
-# 保留老接口：主程序里只调 send_alert / send_sms
 def send_sms(text, port=None, phone=None, timeout=3.0):
-    """发一条短信。失败返回 False，绝不抛异常。"""
     mod = Ec20(port=port, phone=phone)
     try:
         ok, _ = mod.send_sms(text, phone=phone, timeout=timeout)
@@ -1479,15 +1266,6 @@ def send_sms(text, port=None, phone=None, timeout=3.0):
 
 
 def send_alert(reason, detail=""):
-    """告警兜底通道：钉钉不通时用 4G 短信。返回 (ok, 说明)。
-
-    走 Hub.get_modem()：没有 EC20 时自动退回模拟模块，把短信内容写进
-    ~/.baymax/sms_outbox.log，这样"短信已发"这条链路在无硬件时也能演示，
-    避免误认为通知已经发出。
-
-    4G 模块会因 USB 重新枚举短暂离线，所以失败后重试 3 次（每次重新选号），
-    仍失败再退回 AT 通道发一遍。
-    """
     msg = "【大白告警】%s。%s" % (reason, detail) if detail else "【大白告警】%s" % reason
     hub = get_hub()
     last = "未知原因"
@@ -1507,7 +1285,7 @@ def send_alert(reason, detail=""):
                 last = "%s: %s" % (type(e).__name__, e)
         if attempt < 3:
             time.sleep(3)
-            hub.modem = None          # 强制下一轮重新探测模块号
+            hub.modem = None
     try:
         at = Ec20()
         if at.open():
@@ -1520,7 +1298,6 @@ def send_alert(reason, detail=""):
 
 
 def get_position():
-    """4G 定位：返回 "纬度,经度" 或 None（室内基本没有卫星信号）。"""
     try:
         modem = get_hub().get_modem()
     except Exception:
@@ -1535,7 +1312,6 @@ def get_position():
 
 
 def place_call(number=None):
-    """用 4G 打电话。返回 (成功?, 说明)。"""
     try:
         modem = get_hub().get_modem()
     except Exception as e:
@@ -1549,9 +1325,6 @@ def place_call(number=None):
         return False, "%s: %s" % (type(e).__name__, e)
 
 
-# =====================================================================
-#                          五、USB 摄像头
-# =====================================================================
 _CASCADE_PATHS = [
     "/opt/spacemit-ai-tool/cv2/data/haarcascade_frontalface_default.xml",
     "/usr/share/opencv4/haarcascades/haarcascade_frontalface_default.xml",
@@ -1561,7 +1334,6 @@ _CASCADE_PATHS = [
 
 
 class _QuietStderr:
-    """临时把 stderr 指到 /dev/null：OpenCV 打开 CSI 摄像头会刷一屏 GStreamer 警告。"""
 
     def __enter__(self):
         try:
@@ -1600,7 +1372,6 @@ def _load_cascade():
 
 
 class Camera:
-    """UVC 摄像头：抓一帧数人脸。CSI 摄像头在 K1 上会卡，所以带超时保护。"""
 
     def __init__(self, index=None):
         self.index = CAMERA_INDEX if index is None else int(index)
@@ -1695,7 +1466,6 @@ class Camera:
 
 
 class SimCamera:
-    """模拟摄像头：固定返回 1 张人脸（演示"在床边"判断）。"""
 
     def __init__(self, index=0, faces=1):
         self.index = index
@@ -1723,7 +1493,6 @@ class SimCamera:
 
 
 def camera_count_faces(index=None):
-    """抓一帧数人脸；不可用返回 None。"""
     cam = Camera(index)
     try:
         return cam.count_faces()
@@ -1731,11 +1500,7 @@ def camera_count_faces(index=None):
         cam.close()
 
 
-# =====================================================================
-#                       六、统一硬件中枢
-# =====================================================================
 def _sim_allowed(explicit=None):
-    """是否允许在硬件缺失时退回模拟源。"""
     if explicit is not None:
         return bool(explicit)
     if SIM_MODE in ("0", "off", "false", "no", "real"):
@@ -1744,7 +1509,6 @@ def _sim_allowed(explicit=None):
 
 
 class Hub:
-    """把所有外设收在一处：谁在、谁不在、谁是模拟的，一目了然。"""
 
     def __init__(self):
         self.mpu = None
@@ -1756,7 +1520,6 @@ class Hub:
         self._lock = threading.Lock()
         self.info = {}
 
-    # ---------- 摄像头是懒加载的：只有真要数人脸才开，避免和音频抢 USB ----------
     def get_camera(self):
         if self.camera is not None:
             return self.camera
@@ -1767,11 +1530,10 @@ class Hub:
                 return cam
             raise OSError(cam.error or "打开失败")
         except Exception as e:
-            # 没有 UVC 摄像头时，先问厂商的 CSI 方案在不在线（OV5647）
             csi = csi_camera_status()
             if csi:
                 self.info["camera"] = ("在线", csi)
-                self.camera = SimCamera()      # 占位：还没有抓帧通道
+                self.camera = SimCamera()
                 return self.camera
             if _sim_allowed():
                 self.camera = SimCamera()
@@ -1781,16 +1543,12 @@ class Hub:
             return None
 
     def get_modem(self):
-        # 模拟后端不长期缓存：4G 模块会因 USB 重新枚举短暂离线，
-        # 一旦退回 SimEc20，后续所有短信都会写文件而不是真的发出去。
-        # 这里给模拟后端 20 秒重试间隔，到点重新探测真实模块。
         if isinstance(self.modem, SimEc20):
             if time.time() < getattr(self, "_modem_retry_at", 0):
                 return self.modem
             self.modem = None
         if self.modem is not None:
             return self.modem
-        # 1) 优先 ModemManager：系统接管了 4G 模块时，AT 口抢不到
         try:
             mm = MmcliModem()
             if mm.open():
@@ -1802,7 +1560,6 @@ class Hub:
         except Exception as _e:
             self.info["sms"] = ("缺失", "mmcli: %s" % _e)
 
-        # 2) 退回 AT 通道（模块没被 ModemManager 接管时可用）
         try:
             m = Ec20()
             if m.open():
@@ -1819,7 +1576,6 @@ class Hub:
             return None
 
     def start_sensors(self, on_fall=None, on_result=None, fall_hz=20.0):
-        """启动跌倒监测 + 心率血氧。两者都可以单独失败。"""
         fm = FallMonitor(on_fall=on_fall, hz=fall_hz)
         if fm.start():
             self.fall_monitor = fm
@@ -1840,7 +1596,6 @@ class Hub:
         return self
 
     def status(self):
-        """给面板/启动横幅用：[(设备, 型号, 状态, 说明), ...]"""
         rows = []
 
         def _add(dev, model, state, detail):
@@ -1877,7 +1632,6 @@ class Hub:
         if c is None and not cam_info[0]:
             _add("摄像头", "UVC/CSI", "未探测", "需要时才打开，避免和麦克风抢 USB")
         elif cam_info[0] == "在线":
-            # 厂商 CSI 方案（OV5647）已识别到；SimCamera 只是占位
             _add("摄像头", "CSI", "在线", str(cam_info[1]))
         elif isinstance(c, SimCamera):
             _add("摄像头", "UVC/CSI", "模拟", "未检测到摄像头，返回固定人脸数")
@@ -1889,7 +1643,6 @@ class Hub:
         return rows
 
     def write_status(self):
-        """把状态写到 ~/.baymax/hw.json，面板直接读，不用重复探测硬件。"""
         home = os.getenv("BAYMAX_HOME") or os.path.expanduser("~/.baymax")
         data = {
             "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -1934,18 +1687,12 @@ def get_hub():
         return _HUB
 
 
-# =====================================================================
-#                     七、给主程序 / 面板的便捷函数
-# =====================================================================
 def probe():
-    """启动横幅用的一行状态。不启动线程，只探测。"""
     info = {}
     try:
         if SMBUS is None:
             info["mpu6050"] = "不可用（缺 smbus2）"
         else:
-            # 软件 I2C 是独占的：启动瞬间可能有别的探测占着 40/41，
-            # 失败就隔 0.6 秒再试一次，避免横幅上出现"缺失"的假象。
             last = None
             for attempt in range(2):
                 try:
@@ -1995,7 +1742,6 @@ def probe():
         if faces is not None:
             info["camera"] = "OK %s 人脸%d" % (cam.size, faces)
         else:
-            # 没有 UVC 摄像头时，用厂商 cam-test 验证 CSI 传感器在不在线
             info["camera"] = csi_camera_status() or "不可用"
     except Exception:
         info["camera"] = "不可用"
@@ -2007,14 +1753,6 @@ _CSI_LOCK = threading.Lock()
 
 
 def csi_camera_status(timeout=14, ttl=120):
-    """跑一次厂商 cam-test，确认 CSI 摄像头传感器是否在线。
-
-    板子没有标准 V4L2 摄像头驱动，厂商用用户态工具直接驱动 OV5647，
-    所以只能靠它的输出判断。成功返回 "OK CSI ov5647 30fps"，否则 None。
-
-    注意：cam-test 会独占摄像头，**不能并发跑**（启动时 probe() 和后台探测
-    会同时调用），所以这里加锁 + 缓存 2 分钟。
-    """
     with _CSI_LOCK:
         now = time.time()
         if _CSI_CACHE["done"] and now - _CSI_CACHE["ts"] < ttl:
@@ -2045,17 +1783,11 @@ def _csi_camera_probe(timeout=14):
     return None
 
 
-# ---------------------------------------------------------------------
-# CSI 抓帧（厂商 GStreamer 源 spacemitsrc）
-# cam-test 只跑管线不落地文件；gst-launch + spacemitsrc 才能真拿到帧。
-# 输出是 NV12 裸流，这里在内存里转成 RGB 存 JPEG。
-# ---------------------------------------------------------------------
 _CSI_CFG = "/tmp/sdktest.json"
 _CSI_AUTO = "/tmp/csi3_camera_auto.json"
 
 
 def _ensure_csi_config():
-    """spacemitsrc 默认读 /tmp/sdktest.json，必须带自动探测到的型号。"""
     try:
         if not os.path.isfile(_CSI_AUTO):
             env = dict(os.environ)
@@ -2073,11 +1805,6 @@ def _ensure_csi_config():
 
 
 def csi_snapshot(path, frames=12, width=1920, height=1080, timeout=45):
-    """抓一帧存成 JPEG。成功返回 True。
-
-    摄像头同一时刻只能被一个进程占用，后台探测、关怀巡检、跌倒抓拍会互相抢。
-    这里用文件锁做跨进程互斥，并失败重试一次。
-    """
     if not _ensure_csi_config():
         return False
     import fcntl
@@ -2094,7 +1821,6 @@ def csi_snapshot(path, frames=12, width=1920, height=1080, timeout=45):
                 pass
         ok = _csi_capture_once(path, frames, width, height, timeout)
         if not ok:
-            # 摄像头刚被别的进程释放时偶尔要再等一拍，重试一次
             time.sleep(1.5)
             ok = _csi_capture_once(path, frames, width, height, timeout)
         return ok
@@ -2124,7 +1850,6 @@ def _csi_capture_once(path, frames, width, height, timeout):
         n = len(data) // frame_size
         if n <= 0:
             return False
-        # 前几帧还在自动曝光，取最后一帧
         blob = data[(n - 1) * frame_size: n * frame_size]
         arr = np.frombuffer(blob, dtype=np.uint8)
         y = arr[:width * height].reshape(height, width).astype(np.float32)
@@ -2145,7 +1870,6 @@ def _csi_capture_once(path, frames, width, height, timeout):
             pass
         return True
     except subprocess.TimeoutExpired:
-        # 上一次 gst 没释放设备时会一直等到超时：杀掉残留进程，下一次重试即可出帧
         try:
             subprocess.run(["pkill", "-f", "gst-launch-1.0"],
                            capture_output=True, timeout=5)
@@ -2159,7 +1883,6 @@ def _csi_capture_once(path, frames, width, height, timeout):
 
 
 def csi_face_count(image_path):
-    """在抓到的帧上做人脸检测，返回人数；失败返回 None。"""
     try:
         import cv2
     except Exception:
@@ -2185,12 +1908,10 @@ def csi_face_count(image_path):
 
 
 def hw_status():
-    """返回结构化的硬件状态（给面板）。优先用已经启动的 Hub。"""
     return get_hub().write_status()
 
 
 def simulate_fall():
-    """让跌倒监测回放一次模拟跌倒（走真实状态机）。"""
     fm = get_hub().fall_monitor
     if fm is None:
         return False
@@ -2198,16 +1919,12 @@ def simulate_fall():
 
 
 def measure_health():
-    """请求测一次心率血氧。"""
     hm = get_hub().health_monitor
     if hm is None:
         return False
     return hm.request()
 
 
-# =====================================================================
-#                            八、自测
-# =====================================================================
 def _self_test():
     print("=" * 62)
     print("大白 3.3 硬件层自检")
@@ -2234,7 +1951,7 @@ def _machine_self_test():
     calm = [m2.update(i * 0.1, 1.0) for i in range(40)]
     case2 = not any(calm)
 
-    m3 = FallStateMachine(cooldown=0)           # 坐下/放东西：有撞击但没有失重
+    m3 = FallStateMachine(cooldown=0)
     sit = [m3.update(0.0, 1.0), m3.update(0.2, 2.6), m3.update(0.5, 1.0),
            m3.update(3.0, 1.0)]
     case3 = not any(sit)

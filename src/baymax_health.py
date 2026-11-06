@@ -1,18 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""大白健康数据层：把老人说的一句话，变成结构化的健康记录。
-
-说明：心率传感器未接入时，健康数据仍可通过语音录入。
-老人说「我血压 150 90」「刚才血糖 6.8」「体温 37 度五」——
-比戴传感器更符合老人习惯，而且数据是真实的、可核查的。
-
-对外三个函数：
-    parse_vitals(text)    -> dict | None      从口语里抽数值
-    record(entry)         -> dict             落盘到 ~/.baymax/vitals.jsonl
-    evaluate(kind, values)-> (level, phrase_id)  阈值判断 -> 用哪句缓存提示
-
-阈值只做"提示级"，不下诊断结论，措辞全部指向"复测/就医"。
-"""
 import json
 import os
 import re
@@ -21,7 +8,6 @@ import time
 HOME_DIR = os.getenv("BAYMAX_HOME") or os.path.expanduser("~/.baymax")
 VITALS_PATH = os.path.join(HOME_DIR, "vitals.jsonl")
 
-# 全角数字 -> 半角，顺手把常见分隔符统一
 _FULLWIDTH = str.maketrans("０１２３４５６７８９／．", "0123456789/.")
 _UNITS = r"(?:毫米汞柱|mmhg|毫升|mg|次|度|℃)?"
 
@@ -30,11 +16,10 @@ def _norm(text):
     return str(text or "").translate(_FULLWIDTH)
 
 
-# 中文数字 -> 阿拉伯数字（语音识别经常输出"一百五""九十"）
 _CN_DIGIT = {"零": 0, "〇": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4,
              "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
 _CN_NUM_RE = re.compile(
-    r"([一二两三四五六七八九])?百([一二三四五六七八九])?十([一二三四五六七八九])?"   # 百位（含口语省略）
+    r"([一二两三四五六七八九])?百([一二三四五六七八九])?十([一二三四五六七八九])?"
     r"|([一二两三四五六七八九])?百([一二三四五六七八九])?"
     r"|([一二两三四五六七八九])?十([一二三四五六七八九])?"
     r"|([零〇一二两三四五六七八九])"
@@ -42,11 +27,6 @@ _CN_NUM_RE = re.compile(
 
 
 def _cn_to_arabic(text):
-    """把一句话里的中文数字换成阿拉伯数字，保留其他字符。
-
-    「我血压一百五九十」-> 「我血压 150 90」
-    「血压一百五十比九十」-> 「血压 150 比 90」
-    """
     def repl(m):
         if m.group(1) is not None or m.group(2) is not None or m.group(3) is not None:
             hundreds = _CN_DIGIT.get(m.group(1) or "一", 1) * 100
@@ -67,7 +47,7 @@ def _cn_to_arabic(text):
 
     out = text.replace("点", ".")
     out = _CN_NUM_RE.sub(repl, out)
-    out = re.sub(r"\s*\.\s*", ".", out)          # "6 . 8" -> "6.8"
+    out = re.sub(r"\s*\.\s*", ".", out)
     return re.sub(r"\s+", " ", out).strip()
 
 
@@ -79,23 +59,11 @@ def _num(s):
 
 
 def parse_vitals(text):
-    """从一句口语里抽取健康数值。抽不到返回 None。
-
-    支持：
-        血压 150/90、血压 150 90、高压 150 低压 90
-        血糖 6.8、空腹血糖 6.8
-        心率 78、脉搏 78
-        体温 37.2、37 度 2
-        血氧 96
-        体重 62.5
-    """
     t = _norm(text)
     if not t:
         return None
-    # 语音识别常把数字念成中文（"一百五""九十"），先转成阿拉伯数字再匹配
     t = _cn_to_arabic(t)
 
-    # 血压：优先 "150/90" 形式
     m = re.search(r"(?:血压|高压|血压是)?\s*(\d{2,3})\s*[/比比之于]\s*(\d{2,3})", t)
     if m:
         sys_v, dia_v = _num(m.group(1)), _num(m.group(2))
@@ -103,7 +71,6 @@ def parse_vitals(text):
             return {"kind": "bp", "sys": int(sys_v), "dia": int(dia_v),
                     "text": "%d/%d" % (sys_v, dia_v)}
 
-    # 血压：高压 x 低压 y
     m = re.search(r"高压\s*(\d{2,3})", t)
     m2 = re.search(r"低压\s*(\d{2,3})", t)
     if m and m2:
@@ -112,9 +79,6 @@ def parse_vitals(text):
             return {"kind": "bp", "sys": int(sys_v), "dia": int(dia_v),
                     "text": "%d/%d" % (sys_v, dia_v)}
 
-    # 血压：口语两个数字连读，例如"我血压150 90""血压高 150 90"。
-    # 语音识别几乎没有斜杠，不认这种说法就会掉到医疗问答分支（慢且音色不对）。
-    # 必须紧跟“血压/高压”，避免把"今年150斤"之类的数字误判成血压。
     m = re.search(
         r"(?:血压|高压)\s*(?:是|有|为|高|低|有点|大概)?\s*"
         r"(\d{2,3})\s*[，,、\s比之于]*\s*(\d{2,3})", t)
@@ -124,35 +88,30 @@ def parse_vitals(text):
             return {"kind": "bp", "sys": int(sys_v), "dia": int(dia_v),
                     "text": "%d/%d" % (sys_v, dia_v)}
 
-    # 血糖
     m = re.search(r"血糖\s*(?:是|有|为)?\s*(\d{1,2}(?:\.\d)?)", t)
     if m:
         v = _num(m.group(1))
         if v is not None and 1.0 <= v <= 40.0:
             return {"kind": "glucose", "value": v, "text": "%.1f" % v}
 
-    # 心率 / 脉搏
     m = re.search(r"(?:心率|脉搏|心跳)\s*(?:是|有|为)?\s*(\d{2,3})", t)
     if m:
         v = _num(m.group(1))
         if v is not None and 25 <= v <= 250:
             return {"kind": "pulse", "value": int(v), "text": "%d" % v}
 
-    # 血氧
     m = re.search(r"(?:血氧|氧饱和度)\s*(?:是|有|为)?\s*(\d{2,3})", t)
     if m:
         v = _num(m.group(1))
         if v is not None and 50 <= v <= 100:
             return {"kind": "spo2", "value": int(v), "text": "%d" % v}
 
-    # 体温（顺带处理"三十七度二"这种只报数字的常见说法：37.2 / 37 度 2）
     m = re.search(r"体温\s*(?:是|有|为)?\s*(3\d(?:\.\d)?)", t)
     if m:
         v = _num(m.group(1))
         if v is not None and 33.0 <= v <= 43.0:
             return {"kind": "temp", "value": v, "text": "%.1f" % v}
 
-    # 体重
     m = re.search(r"体重\s*(?:是|有|为)?\s*(\d{2,3}(?:\.\d)?)", t)
     if m:
         v = _num(m.group(1))
@@ -163,10 +122,6 @@ def parse_vitals(text):
 
 
 def bp_grade(sys_v, dia_v):
-    """按《中国高血压防治指南》（国家卫健委发布）分级。
-
-    返回 (grade_key, grade_name, level)。
-    """
     if sys_v >= 180 or dia_v >= 110:
         return "grade3", "3级高血压", "danger"
     if sys_v >= 160 or dia_v >= 100:
@@ -181,12 +136,6 @@ def bp_grade(sys_v, dia_v):
 
 
 def evaluate(entry):
-    """返回 (level, phrase_id)。level: normal / attention / high / low / danger。
-
-    phrase_id 对应语音缓存里的固定提示语，避免现场合成。
-    血压分级依据《中国高血压防治指南》：正常<120/80，正常高值120-139/80-89，
-    1级140-159/90-99，2级160-179/100-109，3级≥180/110。
-    """
     if not isinstance(entry, dict):
         return "normal", ""
     kind = entry.get("kind")
@@ -242,7 +191,6 @@ def evaluate(entry):
 
 
 def record(entry, level="normal", note=""):
-    """追加写入档案，返回带时间戳的完整记录。"""
     os.makedirs(HOME_DIR, exist_ok=True)
     rec = {"ts": time.strftime("%Y-%m-%d %H:%M:%S")}
     rec.update(entry or {})
@@ -276,7 +224,6 @@ def load(limit=500):
 
 
 def summary(limit=8):
-    """给面板用的简要汇总：每类最多几条 + 最近记录。"""
     items = load()
     recent = items[-limit:][::-1]
     by_kind = {}
@@ -296,7 +243,6 @@ def summary(limit=8):
     return {"recent": recent, "stats": stats, "total": len(items)}
 
 
-# 语音提示语（会写进 short_texts.json 预生成，这里只做映射）
 ADVICE_TEXT = {
     "vital_ok": "好的，这次数值正常，已经记到健康档案里了。",
     "vital_bp_high": "这次血压偏高，安静休息十分钟再复测一次，还是高就联系医生。",
